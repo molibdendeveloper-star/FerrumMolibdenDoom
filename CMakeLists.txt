@@ -6,7 +6,6 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 find_package(SDL3 REQUIRED)
 
-# Собираем все исходники ядра и платформы
 file(GLOB DOOM_SOURCES "src/doom/*.c")
 file(GLOB PLATFORM_SOURCES "src/platform/*.c")
 
@@ -20,7 +19,6 @@ target_include_directories(molibdendoom PRIVATE
     src/platform
 )
 
-# Обязательно линкуем libm (m) вместе с SDL3
 target_link_libraries(molibdendoom PRIVATE 
     SDL3::SDL3
     m

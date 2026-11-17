@@ -1,44 +1,20 @@
-# MolibdenDOOM
+# FerrumMolibdenDoom
 
-**MolibdenDOOM** is a modern source port based on the original [id Software DOOM source code]([https://github.com](https://github.com/id-Software/Doom)), specifically tailored for **64-bit Linux** systems.
+**FerrumMolibdenDoom** is a DOOM source port rewritten in Rust, based on the **MolibdenDoom** source port.
 
 ## About the Project
 
-The primary goal of MolibdenDOOM is to revitalize the classic 1993 shooter for contemporary operating systems by replacing legacy dependencies with modern libraries such as **SDL3**, while significantly enhancing the gameplay experience with responsive, modern controls.
+The primary goal of **FerrumMolibdenDoom** is to faithfully port the classic DOOM engine from C to Rust. By leveraging Rust's memory safety, strong type system, and modern tooling, this project aims to preserve the authentic gameplay and mechanics of MolibdenDoom while eliminating common C-level bugs and undefined behavior.
 
-### Key Features
-* **64-bit Linux Support:** Refactored and adapted to compile and run natively on modern x86_64 Linux distributions.
-* **Modern Backend:** Legacy video, audio, and input subsystems replaced with **SDL3** and modern equivalents.
-* **Enhanced Controls:** Updated input handling designed for comfortable, modern mouse-and-keyboard gameplay.
+## Acknowledgments
 
-## Roadmap
+- **id Software** for creating DOOM and releasing its source code.
+- **MolibdenDoom** for serving as the foundation and reference implementation for this port.
 
-* [x] Port original codebase to 64-bit Linux
-* [x] Integrate SDL3 for windowing, rendering, and input
-* [ ] **Next Major Milestone:** Rewrite and migrate the entire source port to **Rust** for improved memory safety, maintainability, and performance.
+## AI Disclosure
 
-## Building from Source
-
-### Prerequisites
-* A 64-bit Linux environment
-* CMake (3.10 or higher)
-* C/C++ compiler (GCC or Clang)
-* SDL3 development libraries
-
-### Compilation
-```bash
-git clone https://github.com/molibdendeveloper-star/MolibdenDOOM
-cd MolibdenDOOM
-mkdir build && cd build
-cmake ..
-cmake --build .
-```
-
-## Acknowledgments & Transparency
-
-* **Original Codebase:** Based on the official open-source release by [id Software]([https://github.com](https://github.com/id-Software/Doom)).
-* **AI Assistance:** AI assistants were utilized during the development of this project for refactoring, debugging, and modernization tasks.
+AI assistants were used during the development of this source port to assist with translating C code to Rust, refactoring, and writing documentation.
 
 ## License
 
-This project is licensed under the **GNU General Public License v2.0** — see the [LICENSE.TXT](LICENSE.TXT) file for details, in accordance with the original id Software release.
+This project is distributed under the GNU General Public License v2.0 (GPL-2.0), in accordance with the original DOOM source code release. See the `LICENSE` file for more details.

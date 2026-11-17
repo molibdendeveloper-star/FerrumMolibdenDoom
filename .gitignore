@@ -21,3 +21,7 @@
 *.wad
 *.WAD
 .DS_Store
+
+!ferrum_doom/
+!ferrum_doom/**
+ferrum_doom/target/

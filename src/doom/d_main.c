@@ -1169,3 +1169,7 @@ void D_DoomMain (void)
 
     D_DoomLoop ();  // never returns
 }
+
+void D_SetConsoleMessage(const char* msg) {
+    players[consoleplayer].message = (char*)msg;
+}

@@ -34,6 +34,12 @@ pub mod p_plats;
 pub mod p_maputl;
 pub mod p_map;
 pub mod p_lights;
+pub mod p_inter;
+pub mod p_floor;
+pub mod p_enemy;
+pub mod p_doors;
+pub mod p_ceilng;
+pub mod m_menu;
 
 // --- m_fixed ---
 #[unsafe(no_mangle)]

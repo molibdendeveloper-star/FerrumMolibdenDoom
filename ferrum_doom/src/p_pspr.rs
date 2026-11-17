@@ -12,7 +12,6 @@ use crate::m_fixed::{FRACBITS, fixed_mul};
 use crate::m_random::p_random;
 use crate::p_mobj::{P_SetMobjState, P_SpawnMobj, P_SpawnPlayerMissile};
 use crate::p_tick::leveltime;
-use crate::p_user::ticcmd_t;
 use crate::r_main::R_PointToAngle2;
 use crate::tables::{ANGLETOFINESHIFT, FINEANGLES, FINEMASK, finesine};
 

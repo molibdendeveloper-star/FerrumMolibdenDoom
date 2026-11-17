@@ -50,6 +50,12 @@ pub mod st_stuff;
 pub mod st_lib;
 pub mod dstrings;
 pub mod s_sound;
+pub mod g_game;
+pub mod am_map;
+pub mod d_items;
+pub mod doomdef;
+pub mod doomstat;
+pub mod d_net;
 
 // --- m_fixed ---
 #[unsafe(no_mangle)]

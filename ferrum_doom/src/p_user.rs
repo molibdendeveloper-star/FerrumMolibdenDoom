@@ -22,16 +22,7 @@ const VIEWHEIGHT_VAL: i32 = 41 * (FRACUNIT as i32);
 const CF_NOCLIP_FLAG: u32 = 1;
 const CF_NOMOMENTUM_FLAG: u32 = 4;
 
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct ticcmd_t {
-    pub forwardmove: i8,
-    pub sidemove: i8,
-    pub angleturn: i16,
-    pub consistancy: i16,
-    pub chatchar: u8,
-    pub buttons: u8,
-}
+
 
 unsafe extern "C" {
     fn P_MovePsprites(player: *mut player_t);

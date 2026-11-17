@@ -346,8 +346,8 @@ pub unsafe extern "C" fn R_ScaleFromGlobalAngle(visangle: u32) -> i32 {
         let anglea = ANG90.wrapping_add(visangle.wrapping_sub(viewangle));
         let angleb = ANG90.wrapping_add(visangle.wrapping_sub(rw_normalangle));
 
-        let sinea = finesine[((anglea as i32) >> ANGLETOFINESHIFT) as usize];
-        let sineb = finesine[((angleb as i32) >> ANGLETOFINESHIFT) as usize];
+        let sinea = finesine[((anglea >> ANGLETOFINESHIFT) as usize) & crate::tables::FINEMASK];
+        let sineb = finesine[((angleb >> ANGLETOFINESHIFT) as usize) & crate::tables::FINEMASK];
 
 let num = fixed_mul(projection, sineb) << detailshift;
 let den = fixed_mul(rw_distance, sinea);

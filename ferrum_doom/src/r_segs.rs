@@ -544,8 +544,8 @@ rw_bottomtexturemid = worldtop;
 rw_bottomtexturemid = worldlow;
 }
 }
-rw_toptexturemid += (*sdef).rowoffset;
-rw_bottomtexturemid += (*sdef).rowoffset;
+rw_toptexturemid = rw_toptexturemid.wrapping_add((*sdef).rowoffset);
+rw_bottomtexturemid = rw_bottomtexturemid.wrapping_add((*sdef).rowoffset);
 if (*sdef).midtexture != 0 {
 maskedtexture = 1;
 maskedtexturecol = lastopening.offset(-(rw_x as isize));

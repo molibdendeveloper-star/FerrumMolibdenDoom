@@ -19,7 +19,6 @@ use crate::w_wad::{W_CacheLumpNum, W_GetNumForName, lumpinfo};
 use crate::z_zone::{PU_CACHE, PU_STATIC, Z_Malloc};
 
 pub const MAXVISSPRITES: usize = 128;
-pub const NUMPSPRITES: usize = 2;
 const MINZ: i32 = (FRACUNIT as i32) * 4;
 const BASEYCENTER: i32 = 100;
 const SCR_W: usize = SCREENWIDTH as usize;
@@ -59,7 +58,7 @@ pub struct player_s {
     pub extralight: c_int,
     pub fixedcolormap: c_int,
     pub colormap: c_int,
-    pub psprites: [pspdef_t; NUMPSPRITES],
+    pub psprites: [pspdef_t; NUMPSPRITES as usize],
     pub didsecret: c_int,
 }
 pub type player_t = player_s;
@@ -659,7 +658,7 @@ spritelights = (*sl_ptr.add(lightnum as usize)).as_ptr() as *mut *mut u8;
 mfloorclip = (&raw mut screenheightarray) as *mut c_short;
 mceilingclip = (&raw mut negonearray) as *mut c_short;
 let pspr_base = (&raw mut (*viewplayer).psprites) as *mut pspdef_t;
-for i in 0..NUMPSPRITES {
+for i in 0..(NUMPSPRITES as usize) {
 let psp = pspr_base.add(i);
 if !(*psp).state.is_null() {
 R_DrawPSprite(psp);

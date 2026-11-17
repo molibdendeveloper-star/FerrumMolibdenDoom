@@ -56,6 +56,7 @@ pub mod d_items;
 pub mod doomdef;
 pub mod doomstat;
 pub mod d_net;
+pub mod d_main;
 
 // --- m_fixed ---
 #[unsafe(no_mangle)]

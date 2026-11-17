@@ -14,7 +14,7 @@ use crate::r_draw::{
     dc_translation, dc_x, dc_yh, dc_yl, translationtables, viewheight, viewwidth,
 };
 use crate::r_segs::R_RenderMaskedSegRange;
-use crate::v_video::{column_t, patch_t};
+use crate::v_video::column_t;
 use crate::w_wad::{W_CacheLumpNum, W_GetNumForName, lumpinfo};
 use crate::z_zone::{PU_CACHE, PU_STATIC, Z_Malloc};
 

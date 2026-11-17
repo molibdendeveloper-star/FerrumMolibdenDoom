@@ -11,7 +11,6 @@ use std::ptr;
 
 use crate::m_argv::m_check_parm as M_CheckParm;
 use crate::m_misc::HU_FONTSIZE;
-use crate::v_video::patch_t;
 use crate::r_main::R_SetViewSize;
 use crate::v_video::V_DrawPatchDirect;
 use crate::w_wad::W_CacheLumpName;

@@ -40,6 +40,16 @@ pub mod p_enemy;
 pub mod p_doors;
 pub mod p_ceilng;
 pub mod m_menu;
+pub mod m_cheat;
+pub mod hu_stuff;
+pub mod hu_lib;
+pub mod f_wipe;
+pub mod f_finale;
+pub mod wi_stuff;
+pub mod st_stuff;
+pub mod st_lib;
+pub mod dstrings;
+pub mod s_sound;
 
 // --- m_fixed ---
 #[unsafe(no_mangle)]

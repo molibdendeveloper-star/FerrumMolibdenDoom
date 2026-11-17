@@ -18,7 +18,7 @@ unsafe extern "C" {
     fn I_AllocLow(length: c_int) -> *mut u8;
 }
 
-fn doom_error(msg: &str) -> ! {
+pub fn doom_error(msg: &str) -> ! {
     let c_msg = CString::new(msg).unwrap_or_else(|_| CString::new("Video error").unwrap());
     unsafe {
         I_Error(c_msg.as_ptr());
@@ -26,14 +26,7 @@ fn doom_error(msg: &str) -> ! {
     unreachable!("I_Error should never return");
 }
 
-#[repr(C)]
-pub struct patch_t {
-    pub width: c_short,
-    pub height: c_short,
-    pub leftoffset: c_short,
-    pub topoffset: c_short,
-    pub columnofs: [c_int; 8],
-}
+
 
 #[repr(C)]
 pub struct column_t {
@@ -211,44 +204,69 @@ pub unsafe extern "C" fn V_DrawPatch(
         y -= top_off;
         x -= left_off;
 
-        if x < 0
-            || x + w > SCREENWIDTH as c_int
-            || y < 0
-            || y + h > SCREENHEIGHT as c_int
-            || (scrn as u32) > 4
-        {
-            eprintln!("Patch at {},{} exceeds LFB", x, y);
-            eprintln!("V_DrawPatch: bad patch (ignored)");
+        if (scrn as u32) > 4 {
+            return;
+        }
+
+        let scr_w = SCREENWIDTH as c_int;
+        let scr_h = SCREENHEIGHT as c_int;
+
+        let mark_x = x.max(0);
+        let mark_y = y.max(0);
+        let mark_w = (x + w).min(scr_w) - mark_x;
+        let mark_h = (y + h).min(scr_h) - mark_y;
+        if mark_w <= 0 || mark_h <= 0 {
             return;
         }
 
         if scrn == 0 {
-            V_MarkRect(x, y, w, h);
+            V_MarkRect(mark_x, mark_y, mark_w, mark_h);
         }
 
         let scr_ptr = &raw const screens as *const *mut u8;
-        let mut desttop = (*scr_ptr.add(scrn as usize)).offset((y as isize) * (SCR_W as isize) + (x as isize));
+        let scr_base = *scr_ptr.add(scrn as usize);
         let col_ofs_ptr = &raw const (*patch).columnofs as *const c_int;
 
-        for col in 0..w {
+        let start_col = (-x).max(0);
+        let end_col = (scr_w - x).min(w);
+
+        for col in start_col..end_col {
+            let cur_x = (x + col) as isize;
             let ofs = (*col_ofs_ptr.add(col as usize)) as isize;
             let mut column = (patch as *const u8).offset(ofs) as *const column_t;
 
             while (*column).topdelta != 0xff {
                 let mut source = (column as *const u8).add(3);
-                let mut dest = desttop.add(((*column).topdelta as usize) * SCR_W);
-                let mut count = (*column).length;
+                let mut dest_y = y + ((*column).topdelta as c_int);
+                let mut count = (*column).length as c_int;
 
-                while count > 0 {
-                    *dest = *source;
-                    source = source.add(1);
-dest = dest.add(SCR_W);
-count -= 1;
-}
-column = (column as *const u8).add(((*column).length as usize) + 4) as *const column_t;
-}
-desttop = desttop.add(1);
-}
+                if dest_y < 0 {
+                    let skip = -dest_y;
+                    if skip >= count {
+                        column = (column as *const u8).add(((*column).length as usize) + 4) as *const column_t;
+                        continue;
+                    }
+                    source = source.add(skip as usize);
+                    count -= skip;
+                    dest_y = 0;
+                }
+
+                if dest_y + count > scr_h {
+                    count = scr_h - dest_y;
+                }
+
+                if count > 0 {
+                    let mut dest = scr_base.offset((dest_y as isize) * (SCR_W as isize) + cur_x);
+                    for _ in 0..count {
+                        *dest = *source;
+                        dest = dest.add(SCR_W);
+                        source = source.add(1);
+                    }
+                }
+
+                column = (column as *const u8).add(((*column).length as usize) + 4) as *const column_t;
+            }
+        }
 }
 }
 #[unsafe(no_mangle)]

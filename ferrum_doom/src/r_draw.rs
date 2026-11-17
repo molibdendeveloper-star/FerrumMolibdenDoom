@@ -8,7 +8,7 @@ use std::ffi::{CString, c_char, c_int, c_uint, c_void};
 use std::ptr;
 
 use crate::m_fixed::FRACBITS;
-use crate::v_video::{V_DrawPatch, V_MarkRect, patch_t, screens};
+use crate::v_video::{V_DrawPatch, V_MarkRect, screens};
 use crate::w_wad::W_CacheLumpName;
 use crate::z_zone::{PU_CACHE, PU_STATIC, Z_Malloc};
 
@@ -454,7 +454,7 @@ dest = dest.add(rem);
 }
 let draw_border = |lump: &[u8], x: c_int, y: c_int| {
 let p = W_CacheLumpName(lump.as_ptr() as *const c_char, PU_CACHE) as *mut patch_t;
-V_DrawPatch(x, y, 1, p);
+V_DrawPatch(x, y, 1, p as *mut _);
 };
 let mut x = 0;
 while x < scaledviewwidth {

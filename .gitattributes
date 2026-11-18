@@ -1,2 +1,1 @@
-*.h linguist-language=C
-build/* linguist-vendored
+ferrum_doom/target/* linguist-vendored

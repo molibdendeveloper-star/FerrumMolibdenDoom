@@ -1,72 +1,68 @@
-use std::ffi::{CStr, c_char, c_int};
-use std::ptr;
+use std::ffi::{CString, c_char};
+use std::sync::{OnceLock, RwLock};
 
-// Экспортируем глобальные переменные, так как main() на C записывает в них argc и argv
-#[unsafe(no_mangle)]
-pub static mut myargc: c_int = 0;
+static ARGS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
 
-#[unsafe(no_mangle)]
-pub static mut myargv: *mut *mut c_char = ptr::null_mut();
+fn store() -> &'static RwLock<Vec<String>> {
+    ARGS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Инициализирует или обновляет список аргументов командной строки (включая @response-файлы).
+pub fn set_args(args: Vec<String>) {
+    if let Ok(mut guard) = store().write() {
+        *guard = args;
+    }
+}
+
+/// Возвращает количество аргументов командной строки.
+pub fn args_len() -> usize {
+    store().read().map(|g| g.len()).unwrap_or(0)
+}
+
+/// Возвращает аргумент по индексу в виде `String`.
+pub fn get_arg(index: usize) -> Option<String> {
+    store().read().ok().and_then(|g| g.get(index).cloned())
+}
+
+/// Возвращает C-строку для совместимости с legacy-функциями, ожидающими `*mut c_char`.
+pub fn get_arg_cptr(index: usize) -> *mut c_char {
+    match get_arg(index).and_then(|s| CString::new(s).ok()) {
+        Some(cstr) => cstr.into_raw(),
+        None => std::ptr::null_mut(),
+    }
+}
 
 /// Проверяет наличие аргумента в командной строке (без учета регистра).
-/// Возвращает индекс аргумента (от 1 до myargc - 1) или 0, если аргумент не найден.
+/// Возвращает индекс аргумента (от 1 до len - 1) или 0, если аргумент не найден.
 pub fn m_check_parm(check: &str) -> i32 {
-    unsafe {
-        if myargc <= 1 || myargv.is_null() {
-            return 0;
-        }
-
-        // Превращаем сырой указатель char** в безопасный срез Rust
-        let args = std::slice::from_raw_parts(myargv, myargc as usize);
-
-        // Начинаем с 1, пропуская имя самого исполняемого файла (args[0])
-        for (i, &arg_ptr) in args.iter().enumerate().skip(1) {
-            if arg_ptr.is_null() {
-                continue;
-            }
-
-            if let Ok(arg_str) = CStr::from_ptr(arg_ptr).to_str() {
-                if arg_str.eq_ignore_ascii_case(check) {
-                    return i as i32;
-                }
-            }
+    let Ok(guard) = store().read() else {
+        return 0;
+    };
+    for (i, arg) in guard.iter().enumerate().skip(1) {
+        if arg.eq_ignore_ascii_case(check) {
+            return i as i32;
         }
     }
-
     0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CString;
 
     #[test]
     fn test_check_parm() {
-        let arg0 = CString::new("./fmdoom").unwrap();
-        let arg1 = CString::new("-file").unwrap();
-        let arg2 = CString::new("DOOM.WAD").unwrap();
-        let arg3 = CString::new("-SKILL").unwrap();
+        set_args(vec![
+            "./fmdoom".into(),
+            "-file".into(),
+            "DOOM.WAD".into(),
+            "-SKILL".into(),
+        ]);
 
-        let mut ptrs = [
-            arg0.as_ptr() as *mut c_char,
-            arg1.as_ptr() as *mut c_char,
-            arg2.as_ptr() as *mut c_char,
-            arg3.as_ptr() as *mut c_char,
-        ];
-
-        unsafe {
-            myargc = ptrs.len() as c_int;
-            myargv = ptrs.as_mut_ptr();
-
-            assert_eq!(m_check_parm("-file"), 1);
-            assert_eq!(m_check_parm("-FILE"), 1); // Проверка без учета регистра
-            assert_eq!(m_check_parm("-skill"), 3);
-            assert_eq!(m_check_parm("-warp"), 0); // Несуществующий флаг
-
-            // Сбрасываем указатели после теста
-            myargc = 0;
-            myargv = ptr::null_mut();
-        }
+        assert_eq!(m_check_parm("-file"), 1);
+        assert_eq!(m_check_parm("-FILE"), 1);
+        assert_eq!(m_check_parm("-skill"), 3);
+        assert_eq!(m_check_parm("-warp"), 0);
+        assert_eq!(get_arg(2).as_deref(), Some("DOOM.WAD"));
     }
 }

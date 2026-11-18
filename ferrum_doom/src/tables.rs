@@ -26,8 +26,7 @@ pub const fn slope_div(num: u32, den: u32) -> i32 {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn SlopeDiv(num: c_uint, den: c_uint) -> c_int {
+pub fn SlopeDiv(num: c_uint, den: c_uint) -> c_int {
     slope_div(num, den)
 }
 
@@ -45,7 +44,6 @@ mod tests {
         assert_eq!(tantoangle.len(), 2049);
     }
 }
-#[unsafe(no_mangle)]
 pub static finetangent: [i32; 4096] =
 [
     -170910304,-56965752,-34178904,-24413316,-18988036,-15535599,-13145455,-11392683,
@@ -563,7 +561,6 @@ pub static finetangent: [i32; 4096] =
 ];
 
 
-#[unsafe(no_mangle)]
 pub static finesine: [i32; 10240] =
 [
     25,75,125,175,226,276,326,376,
@@ -1850,7 +1847,6 @@ pub static finesine: [i32; 10240] =
 
 
 
-#[unsafe(no_mangle)]
 pub static tantoangle: [u32; 2049] =
 [
     0,333772,667544,1001315,1335086,1668857,2002626,2336395,

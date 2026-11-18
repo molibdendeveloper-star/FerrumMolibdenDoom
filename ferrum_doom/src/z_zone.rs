@@ -1,6 +1,21 @@
-use std::ffi::{CString, c_char, c_int, c_void};
-use std::mem::size_of;
+#![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code)]
+
+use std::collections::HashMap;
+use std::ffi::{c_int, c_void};
 use std::ptr;
+use std::sync::{Mutex, OnceLock};
+
+use crate::v_video::doom_error;
+
+#[repr(C)]
+pub struct MemBlock {
+    pub size: c_int,
+    pub user: *mut *mut c_void,
+    pub tag: c_int,
+    pub id: c_int,
+    pub next: *mut MemBlock,
+    pub prev: *mut MemBlock,
+}
 
 pub const ZONEID: i32 = 0x1d4a11;
 pub const MINFRAGMENT: i32 = 64;
@@ -15,307 +30,199 @@ pub const PU_LEVSPEC: c_int = 51;
 pub const PU_PURGELEVEL: c_int = 100;
 pub const PU_CACHE: c_int = 101;
 
-// Импортируем функции из C-части движка
-unsafe extern "C" {
-    fn I_ZoneBase(size: *mut c_int) -> *mut u8;
-    fn I_Error(error: *const c_char, ...);
+const DEFAULT_ZONE_BYTES: usize = 32 * 1024 * 1024; // 32 МБ виртуального бюджета
+
+struct ZoneBlock {
+    _storage: Box<[u64]>,
+    size: usize,
+    tag: c_int,
+    user: usize, // Адрес *mut *mut c_void или 2 (unowned)
 }
 
-#[repr(C)]
-pub struct MemBlock {
-    pub size: c_int,
-    pub user: *mut *mut c_void,
-    pub tag: c_int,
-    pub id: c_int,
-    pub next: *mut MemBlock,
-    pub prev: *mut MemBlock,
+struct ZoneAllocator {
+    blocks: HashMap<usize, ZoneBlock>,
+    used_bytes: usize,
+    total_budget: usize,
 }
 
-#[repr(C)]
-pub struct MemZone {
-    pub size: c_int,
-    pub blocklist: MemBlock,
-    pub rover: *mut MemBlock,
-}
-
-#[unsafe(no_mangle)]
-pub static mut mainzone: *mut MemZone = ptr::null_mut();
-
-/// Вспомогательная функция для вызова C-функции I_Error из Rust
-fn doom_error(msg: &str) -> ! {
-    let c_msg = CString::new(msg).unwrap_or_else(|_| CString::new("Zone memory error").unwrap());
-    unsafe {
-        I_Error(c_msg.as_ptr());
+impl ZoneAllocator {
+    fn new(budget: usize) -> Self {
+        Self {
+            blocks: HashMap::with_capacity(4096),
+            used_bytes: 0,
+            total_budget: budget,
+        }
     }
-    unreachable!("I_Error should never return");
-}
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn Z_ClearZone(zone: *mut MemZone) {
-    unsafe {
-        let block = (zone as *mut u8).add(size_of::<MemZone>()) as *mut MemBlock;
+    fn alloc(&mut self, raw_size: c_int, tag: c_int, user_addr: usize) -> *mut c_void {
+        if raw_size < 0 {
+            doom_error(&format!("Z_Malloc: negative allocation {}", raw_size));
+        }
+        if user_addr == 0 && tag >= PU_PURGELEVEL {
+            doom_error("Z_Malloc: an owner is required for purgable blocks");
+        }
 
-        (*zone).blocklist.next = block;
-        (*zone).blocklist.prev = block;
-        (*zone).blocklist.user = zone as *mut *mut c_void;
-        (*zone).blocklist.tag = PU_STATIC;
-        (*zone).rover = block;
+        let aligned_bytes = ((raw_size as usize) + 7) & !7;
+        let words = (aligned_bytes / 8).max(1);
 
-        (*block).prev = &mut (*zone).blocklist;
-        (*block).next = &mut (*zone).blocklist;
-        (*block).user = ptr::null_mut();
-        (*block).size = (*zone).size - size_of::<MemZone>() as c_int;
+        // Если приближаемся к бюджету — вытесняем кэшируемые блоки (tag >= PU_PURGELEVEL)
+        if self.used_bytes + aligned_bytes > self.total_budget {
+            self.purge_cache();
+        }
+
+        let mut storage = vec![0u64; words].into_boxed_slice();
+        let ptr = storage.as_mut_ptr() as *mut c_void;
+        let addr = ptr as usize;
+
+        let owner = if user_addr != 0 {
+            unsafe {
+                *(user_addr as *mut *mut c_void) = ptr;
+            }
+            user_addr
+        } else {
+            2
+        };
+
+        self.used_bytes += aligned_bytes;
+        self.blocks.insert(
+            addr,
+            ZoneBlock {
+                _storage: storage,
+                size: aligned_bytes,
+                tag,
+                user: owner,
+            },
+        );
+
+        ptr
+    }
+
+    fn free(&mut self, ptr: *mut c_void) {
+        if ptr.is_null() {
+            return;
+        }
+        let addr = ptr as usize;
+        let Some(block) = self.blocks.remove(&addr) else {
+            doom_error("Z_Free: freed a pointer without ZONEID");
+        };
+
+        if block.user > 0x100 {
+            unsafe {
+                *(block.user as *mut *mut c_void) = ptr::null_mut();
+            }
+        }
+        self.used_bytes = self.used_bytes.saturating_sub(block.size);
+    }
+
+    fn free_tags(&mut self, lowtag: c_int, hightag: c_int) {
+        let to_free: Vec<usize> = self
+            .blocks
+            .iter()
+            .filter(|(_, b)| b.tag >= lowtag && b.tag <= hightag)
+            .map(|(&addr, _)| addr)
+            .collect();
+
+        for addr in to_free {
+            self.free(addr as *mut c_void);
+        }
+    }
+
+    fn purge_cache(&mut self) {
+        self.free_tags(PU_PURGELEVEL, i32::MAX);
+    }
+
+    fn change_tag(&mut self, ptr: *mut c_void, tag: c_int) {
+        if ptr.is_null() {
+            return;
+        }
+        let addr = ptr as usize;
+        let Some(block) = self.blocks.get_mut(&addr) else {
+            doom_error("Z_ChangeTag: freed a pointer without ZONEID");
+        };
+        if tag >= PU_PURGELEVEL && block.user < 0x100 {
+            doom_error("Z_ChangeTag: an owner is required for purgable blocks");
+        }
+        block.tag = tag;
+    }
+
+    fn free_memory(&self) -> c_int {
+        let purgable: usize = self
+            .blocks
+            .values()
+            .filter(|b| b.tag >= PU_PURGELEVEL)
+            .map(|b| b.size)
+            .sum();
+        let avail = self.total_budget.saturating_sub(self.used_bytes) + purgable;
+        avail.min(c_int::MAX as usize) as c_int
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn Z_Init() {
-    unsafe {
-        let mut size: c_int = 0;
-        let base = I_ZoneBase(&mut size);
-        mainzone = base as *mut MemZone;
-        (*mainzone).size = size;
+static ZONE: OnceLock<Mutex<ZoneAllocator>> = OnceLock::new();
 
-        Z_ClearZone(mainzone);
+fn zone() -> &'static Mutex<ZoneAllocator> {
+    ZONE.get_or_init(|| Mutex::new(ZoneAllocator::new(DEFAULT_ZONE_BYTES)))
+}
+
+pub fn get_block_tag(ptr: *mut c_void) -> Option<c_int> {
+    if ptr.is_null() {
+        return None;
     }
+    let addr = ptr as usize;
+    zone().lock().ok().and_then(|z| z.blocks.get(&addr).map(|b| b.tag))
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn Z_Free(ptr: *mut c_void) {
+pub extern "C" fn Z_Init() {
+    let _ = zone();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Z_Free(ptr: *mut c_void) {
     if ptr.is_null() {
         return;
     }
+    zone().lock().unwrap().free(ptr);
+}
 
-    unsafe {
-        let mut block = (ptr as *mut u8).sub(size_of::<MemBlock>()) as *mut MemBlock;
+#[unsafe(no_mangle)]
+pub extern "C" fn Z_Malloc(size: c_int, tag: c_int, user: *mut c_void) -> *mut c_void {
+    zone().lock().unwrap().alloc(size, tag, user as usize)
+}
 
-        if (*block).id != ZONEID {
-            doom_error("Z_Free: freed a pointer without ZONEID");
-        }
+#[unsafe(no_mangle)]
+pub extern "C" fn Z_FreeTags(lowtag: c_int, hightag: c_int) {
+    zone().lock().unwrap().free_tags(lowtag, hightag);
+}
 
-        // Значения <= 0x100 используются как маркеры (например, (void*)2 для unowned), а не реальные указатели
-        if ((*block).user as usize) > 0x100 {
-            *(*block).user = ptr::null_mut();
-        }
-
-        (*block).user = ptr::null_mut();
-        (*block).tag = 0;
-        (*block).id = 0;
-
-        // Слияние с предыдущим свободным блоком
-        let other_prev = (*block).prev;
-        if (*other_prev).user.is_null() {
-            (*other_prev).size += (*block).size;
-            (*other_prev).next = (*block).next;
-            (*(*other_prev).next).prev = other_prev;
-
-            if block == (*mainzone).rover {
-                (*mainzone).rover = other_prev;
-            }
-            block = other_prev;
-        }
-
-        // Слияние со следующим свободным блоком
-        let other_next = (*block).next;
-        if (*other_next).user.is_null() {
-            (*block).size += (*other_next).size;
-            (*block).next = (*other_next).next;
-            (*(*block).next).prev = block;
-
-            if other_next == (*mainzone).rover {
-                (*mainzone).rover = block;
-            }
+#[unsafe(no_mangle)]
+pub extern "C" fn Z_DumpHeap(lowtag: c_int, hightag: c_int) {
+    let z = zone().lock().unwrap();
+    println!("zone budget: {}  used: {}", z.total_budget, z.used_bytes);
+    println!("tag range: {} to {}", lowtag, hightag);
+    for (&addr, b) in &z.blocks {
+        if b.tag >= lowtag && b.tag <= hightag {
+            println!(
+                "block:{:#x}    size:{:7}    user:{:#x}    tag:{:3}",
+                addr, b.size, b.user, b.tag
+            );
         }
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn Z_Malloc(mut size: c_int, tag: c_int, user: *mut c_void) -> *mut c_void {
-    unsafe {
-        // Выравнивание по 8 байт (критично для 64-битного Linux!)
-        size = (size + 7) & !7;
-        size += size_of::<MemBlock>() as c_int;
-
-        let mut base = (*mainzone).rover;
-
-        if (*(*base).prev).user.is_null() {
-            base = (*base).prev;
-        }
-
-        let mut rover = base;
-        let start = (*base).prev;
-
-        loop {
-            if rover == start {
-                doom_error(&format!("Z_Malloc: failed on allocation of {} bytes", size));
-            }
-
-            if !(*rover).user.is_null() {
-                if (*rover).tag < PU_PURGELEVEL {
-                    rover = (*rover).next;
-                    base = rover;
-                } else {
-                    base = (*base).prev;
-                    let data_ptr = (rover as *mut u8).add(size_of::<MemBlock>()) as *mut c_void;
-                    Z_Free(data_ptr);
-                    base = (*base).next;
-                    rover = (*base).next;
-                }
-            } else {
-                rover = (*rover).next;
-            }
-
-            if (*base).user.is_null() && (*base).size >= size {
-                break;
-            }
-        }
-
-        let extra = (*base).size - size;
-        if extra > MINFRAGMENT {
-            let newblock = (base as *mut u8).add(size as usize) as *mut MemBlock;
-            (*newblock).size = extra;
-            (*newblock).user = ptr::null_mut();
-            (*newblock).tag = 0;
-            (*newblock).prev = base;
-            (*newblock).next = (*base).next;
-            (*(*newblock).next).prev = newblock;
-
-            (*base).next = newblock;
-            (*base).size = size;
-        }
-
-        if !user.is_null() {
-            (*base).user = user as *mut *mut c_void;
-            let data_ptr = (base as *mut u8).add(size_of::<MemBlock>()) as *mut c_void;
-            *(user as *mut *mut c_void) = data_ptr;
-        } else {
-            if tag >= PU_PURGELEVEL {
-                doom_error("Z_Malloc: an owner is required for purgable blocks");
-            }
-            (*base).user = 2 as *mut *mut c_void;
-        }
-
-        (*base).tag = tag;
-        (*mainzone).rover = (*base).next;
-        (*base).id = ZONEID;
-
-        (base as *mut u8).add(size_of::<MemBlock>()) as *mut c_void
-    }
+pub extern "C" fn Z_FileDumpHeap(_f: *mut c_void) {
+    Z_DumpHeap(0, 1000);
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn Z_FreeTags(lowtag: c_int, hightag: c_int) {
-    unsafe {
-        let mut block = (*mainzone).blocklist.next;
-        while block != &mut (*mainzone).blocklist {
-            let next = (*block).next;
+pub extern "C" fn Z_CheckHeap() {}
 
-            if !(*block).user.is_null() && (*block).tag >= lowtag && (*block).tag <= hightag {
-                let data_ptr = (block as *mut u8).add(size_of::<MemBlock>()) as *mut c_void;
-                Z_Free(data_ptr);
-            }
-
-            block = next;
-        }
-    }
+#[unsafe(no_mangle)]
+pub extern "C" fn Z_ChangeTag2(ptr: *mut c_void, tag: c_int) {
+    zone().lock().unwrap().change_tag(ptr, tag);
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn Z_DumpHeap(lowtag: c_int, hightag: c_int) {
-    unsafe {
-        let zone = mainzone;
-        println!("zone size: {}  location: {:p}", (*zone).size, zone);
-        println!("tag range: {} to {}", lowtag, hightag);
-
-        let mut block = (*mainzone).blocklist.next;
-        loop {
-            if (*block).tag >= lowtag && (*block).tag <= hightag {
-                println!(
-                    "block:{:p}    size:{:7}    user:{:p}    tag:{:3}",
-                    block, (*block).size, (*block).user, (*block).tag
-                );
-            }
-
-            if (*block).next == &mut (*mainzone).blocklist {
-                break;
-            }
-
-            if (block as *mut u8).add((*block).size as usize) != (*block).next as *mut u8 {
-                println!("ERROR: block size does not touch the next block");
-            }
-            if (*(*block).next).prev != block {
-                println!("ERROR: next block doesn't have proper back link");
-            }
-            if (*block).user.is_null() && (*(*block).next).user.is_null() {
-                println!("ERROR: two consecutive free blocks");
-            }
-
-            block = (*block).next;
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn Z_FileDumpHeap(_f: *mut c_void) {
-    // Вызываем консольный дамп для совместимости ABI
-    unsafe {
-        Z_DumpHeap(0, 1000);
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn Z_CheckHeap() {
-    unsafe {
-        let mut block = (*mainzone).blocklist.next;
-        loop {
-            if (*block).next == &mut (*mainzone).blocklist {
-                break;
-            }
-
-            if (block as *mut u8).add((*block).size as usize) != (*block).next as *mut u8 {
-                doom_error("Z_CheckHeap: block size does not touch the next block\n");
-            }
-            if (*(*block).next).prev != block {
-                doom_error("Z_CheckHeap: next block doesn't have proper back link\n");
-            }
-            if (*block).user.is_null() && (*(*block).next).user.is_null() {
-                doom_error("Z_CheckHeap: two consecutive free blocks\n");
-            }
-
-            block = (*block).next;
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn Z_ChangeTag2(ptr: *mut c_void, tag: c_int) {
-    unsafe {
-        let block = (ptr as *mut u8).sub(size_of::<MemBlock>()) as *mut MemBlock;
-
-        if (*block).id != ZONEID {
-            doom_error("Z_ChangeTag: freed a pointer without ZONEID");
-        }
-
-        if tag >= PU_PURGELEVEL && ((*block).user as usize) < 0x100 {
-            doom_error("Z_ChangeTag: an owner is required for purgable blocks");
-        }
-
-        (*block).tag = tag;
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn Z_FreeMemory() -> c_int {
-    unsafe {
-        let mut free: c_int = 0;
-        let mut block = (*mainzone).blocklist.next;
-
-        while block != &mut (*mainzone).blocklist {
-            if (*block).user.is_null() || (*block).tag >= PU_PURGELEVEL {
-                free += (*block).size;
-            }
-            block = (*block).next;
-        }
-        free
-    }
+pub extern "C" fn Z_FreeMemory() -> c_int {
+    zone().lock().unwrap().free_memory()
 }

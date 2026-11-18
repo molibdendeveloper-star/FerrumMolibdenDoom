@@ -1,7 +1,8 @@
-#![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code)]
+#![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, static_mut_refs)]
 
 pub use crate::bindings::*;
 use crate::r_segs::line_s;
+use crate::r_sky::{get_sky_flat_num, get_sky_texture, get_sky_texture_mid};
 use crate::r_things::player_s;
 
 use std::ffi::{CString, c_char, c_int, c_short, c_void};
@@ -33,10 +34,6 @@ unsafe extern "C" {
     static mut centerxfrac: i32;
     static mut detailshift: c_int;
     static mut extralight: c_int;
-
-    static mut skyflatnum: c_int;
-    static mut skytexture: c_int;
-    static mut skytexturemid: i32;
     static mut pspriteiscale: i32;
 
     static mut firstflat: c_int;
@@ -47,7 +44,6 @@ unsafe extern "C" {
 
     static mut xtoviewangle: [u32; SCR_W + 1];
 
-    // Переменные отрисовки спанов и столбцов (r_draw.c)
     static mut ds_y: c_int;
     static mut ds_x1: c_int;
     static mut ds_x2: c_int;
@@ -78,7 +74,20 @@ fn doom_error(msg: &str) -> ! {
     unreachable!("I_Error should never return");
 }
 
-// --- Глобальные переменные r_plane.c ---
+const EMPTY_VISPLANE: visplane_t = visplane_t {
+    height: 0,
+    picnum: 0,
+    lightlevel: 0,
+    minx: 0,
+    maxx: 0,
+    pad1: 0,
+    top: [0; 320],
+    pad2: 0,
+    pad3: 0,
+    bottom: [0; 320],
+    pad4: 0,
+};
+
 #[unsafe(no_mangle)]
 pub static mut floorfunc: planefunction_t = None;
 
@@ -86,8 +95,7 @@ pub static mut floorfunc: planefunction_t = None;
 pub static mut ceilingfunc: planefunction_t = None;
 
 #[unsafe(no_mangle)]
-pub static mut visplanes: [visplane_t; MAXVISPLANES] =
-    [unsafe { std::mem::zeroed() }; MAXVISPLANES];
+pub static mut visplanes: [visplane_t; MAXVISPLANES] = [EMPTY_VISPLANE; MAXVISPLANES];
 
 #[unsafe(no_mangle)]
 pub static mut lastvisplane: *mut visplane_t = ptr::null_mut();
@@ -147,9 +155,7 @@ pub static mut cachedxstep: [i32; SCR_H] = [0; SCR_H];
 pub static mut cachedystep: [i32; SCR_H] = [0; SCR_H];
 
 #[unsafe(no_mangle)]
-pub extern "C" fn R_InitPlanes() {
-    // Doh!
-}
+pub extern "C" fn R_InitPlanes() {}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_MapPlane(y: c_int, x1: c_int, x2: c_int) {
@@ -159,34 +165,33 @@ pub unsafe extern "C" fn R_MapPlane(y: c_int, x1: c_int, x2: c_int) {
         }
 
         let yu = y as usize;
-        let ch_ptr = (&raw mut cachedheight) as *mut i32;
-        let cd_ptr = (&raw mut cacheddistance) as *mut i32;
-        let cx_ptr = (&raw mut cachedxstep) as *mut i32;
-        let cy_ptr = (&raw mut cachedystep) as *mut i32;
-        let ys_ptr = (&raw const yslope) as *const i32;
+        let ch = &mut *(&raw mut cachedheight);
+        let cd = &mut *(&raw mut cacheddistance);
+        let cx = &mut *(&raw mut cachedxstep);
+        let cy = &mut *(&raw mut cachedystep);
+        let ys = &*(&raw const yslope);
 
-        let distance = if planeheight != *ch_ptr.add(yu) {
-            *ch_ptr.add(yu) = planeheight;
-            let dist = fixed_mul(planeheight, *ys_ptr.add(yu));
-            *cd_ptr.add(yu) = dist;
+        let distance = if planeheight != ch[yu] {
+            ch[yu] = planeheight;
+            let dist = fixed_mul(planeheight, ys[yu]);
+            cd[yu] = dist;
             ds_xstep = fixed_mul(dist, basexscale);
-            *cx_ptr.add(yu) = ds_xstep;
+            cx[yu] = ds_xstep;
             ds_ystep = fixed_mul(dist, baseyscale);
-            *cy_ptr.add(yu) = ds_ystep;
+            cy[yu] = ds_ystep;
             dist
         } else {
-            ds_xstep = *cx_ptr.add(yu);
-            ds_ystep = *cy_ptr.add(yu);
-            *cd_ptr.add(yu)
+            ds_xstep = cx[yu];
+            ds_ystep = cy[yu];
+            cd[yu]
         };
 
-        let ds_ptr = (&raw const distscale) as *const i32;
-        let length = fixed_mul(distance, *ds_ptr.add(x1 as usize));
+        let ds_arr = &*(&raw const distscale);
+        let length = fixed_mul(distance, ds_arr[x1 as usize]);
 
-        let xtv_ptr = (&raw const xtoviewangle) as *const u32;
-        let angle = (viewangle.wrapping_add(*xtv_ptr.add(x1 as usize)) >> ANGLETOFINESHIFT) as usize;
+        let xtv = (&raw const xtoviewangle).as_ref().unwrap();
+        let angle = (viewangle.wrapping_add(xtv[x1 as usize]) >> ANGLETOFINESHIFT) as usize;
 
-        // finecosine[angle] == finesine[angle + FINEANGLES / 4]
         let finecos = finesine[angle + (FINEANGLES / 4)];
         let finesin = finesine[angle];
 
@@ -216,18 +221,18 @@ pub unsafe extern "C" fn R_MapPlane(y: c_int, x1: c_int, x2: c_int) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_ClearPlanes() {
     unsafe {
-        let fc_ptr = (&raw mut floorclip) as *mut c_short;
-        let cc_ptr = (&raw mut ceilingclip) as *mut c_short;
+        let vw = viewwidth as usize;
+        let vh = viewheight as c_short;
+        let fc = &mut *(&raw mut floorclip);
+        let cc = &mut *(&raw mut ceilingclip);
 
-        for i in 0..(viewwidth as usize) {
-            *fc_ptr.add(i) = viewheight as c_short;
-            *cc_ptr.add(i) = -1;
-        }
+        fc[..vw].fill(vh);
+        cc[..vw].fill(-1);
 
         lastvisplane = (&raw mut visplanes) as *mut visplane_t;
         lastopening = (&raw mut openings) as *mut c_short;
 
-        ptr::write_bytes((&raw mut cachedheight) as *mut u8, 0, SCR_H * std::mem::size_of::<i32>());
+        (&mut *(&raw mut cachedheight)).fill(0);
 
         let angle = (viewangle.wrapping_sub(ANG90) >> ANGLETOFINESHIFT) as usize;
         let finecos = finesine[angle + (FINEANGLES / 4)];
@@ -245,40 +250,36 @@ pub unsafe extern "C" fn R_FindPlane(
     mut lightlevel: c_int,
 ) -> *mut visplane_t {
     unsafe {
-        if picnum == skyflatnum {
+        if picnum == get_sky_flat_num() {
             height = 0;
             lightlevel = 0;
         }
 
         let vp_base = (&raw mut visplanes) as *mut visplane_t;
-        let mut check = vp_base;
+        let used_count = lastvisplane.offset_from(vp_base) as usize;
+        let active_vps = std::slice::from_raw_parts_mut(vp_base, used_count);
 
-        while check < lastvisplane {
-            if height == (*check).height
-                && picnum == (*check).picnum
-                && lightlevel == (*check).lightlevel
-            {
-                return check;
+        for vp in active_vps {
+            if height == vp.height && picnum == vp.picnum && lightlevel == vp.lightlevel {
+                return vp as *mut visplane_t;
             }
-            check = check.add(1);
         }
 
-        if lastvisplane.offset_from(vp_base) as usize == MAXVISPLANES {
+        if used_count >= MAXVISPLANES {
             doom_error("R_FindPlane: no more visplanes");
         }
 
+        let new_vp = &mut *lastvisplane;
         lastvisplane = lastvisplane.add(1);
 
-        (*check).height = height;
-        (*check).picnum = picnum;
-        (*check).lightlevel = lightlevel;
-        (*check).minx = SCREENWIDTH as c_int;
-        (*check).maxx = -1;
+        new_vp.height = height;
+        new_vp.picnum = picnum;
+        new_vp.lightlevel = lightlevel;
+        new_vp.minx = SCREENWIDTH as c_int;
+        new_vp.maxx = -1;
+        new_vp.top.fill(0xff);
 
-        let top_ptr = (&raw mut (*check).top) as *mut u8;
-        ptr::write_bytes(top_ptr, 0xff, std::mem::size_of_val(&(*check).top));
-
-        check
+        new_vp as *mut visplane_t
     }
 }
 
@@ -289,45 +290,40 @@ pub unsafe extern "C" fn R_CheckPlane(
     stop: c_int,
 ) -> *mut visplane_t {
     unsafe {
-        let (intrl, unionl) = if start < (*pl).minx {
-            ((*pl).minx, start)
+        let cur = &mut *pl;
+        let (intrl, unionl) = if start < cur.minx {
+            (cur.minx, start)
         } else {
-            (start, (*pl).minx)
+            (start, cur.minx)
         };
 
-        let (intrh, unionh) = if stop > (*pl).maxx {
-            ((*pl).maxx, stop)
+        let (intrh, unionh) = if stop > cur.maxx {
+            (cur.maxx, stop)
         } else {
-            (stop, (*pl).maxx)
+            (stop, cur.maxx)
         };
 
-        let top_ptr = (&raw const (*pl).top) as *const u8;
-        let mut x = intrl;
-        while x <= intrh {
-            if *top_ptr.add(x as usize) != 0xff {
-                break;
-            }
-            x += 1;
-        }
+        let has_overlap = intrl <= intrh && cur.top[(intrl as usize)..=(intrh as usize)]
+            .iter()
+            .any(|&v| v != 0xff);
 
-        if x > intrh {
-            (*pl).minx = unionl;
-            (*pl).maxx = unionh;
+        if !has_overlap {
+            cur.minx = unionl;
+            cur.maxx = unionh;
             return pl;
         }
 
-        (*lastvisplane).height = (*pl).height;
-        (*lastvisplane).picnum = (*pl).picnum;
-        (*lastvisplane).lightlevel = (*pl).lightlevel;
+        let next_vp = &mut *lastvisplane;
+        next_vp.height = cur.height;
+        next_vp.picnum = cur.picnum;
+        next_vp.lightlevel = cur.lightlevel;
 
         pl = lastvisplane;
         lastvisplane = lastvisplane.add(1);
 
-        (*pl).minx = start;
-        (*pl).maxx = stop;
-
-        let new_top_ptr = (&raw mut (*pl).top) as *mut u8;
-        ptr::write_bytes(new_top_ptr, 0xff, std::mem::size_of_val(&(*pl).top));
+        next_vp.minx = start;
+        next_vp.maxx = stop;
+        next_vp.top.fill(0xff);
 
         pl
     }
@@ -342,26 +338,27 @@ pub unsafe extern "C" fn R_MakeSpans(
     mut b2: c_int,
 ) {
     unsafe {
-        let ss_ptr = (&raw mut spanstart) as *mut c_int;
+        let ss = &mut *(&raw mut spanstart);
 
         while t1 < t2 && t1 <= b1 {
-R_MapPlane(t1, *ss_ptr.add(t1 as usize), x - 1);
-t1 += 1;
+            R_MapPlane(t1, ss[t1 as usize], x - 1);
+            t1 += 1;
+        }
+        while b1 > b2 && b1 >= t1 {
+            R_MapPlane(b1, ss[b1 as usize], x - 1);
+            b1 -= 1;
+        }
+        while t2 < t1 && t2 <= b2 {
+            ss[t2 as usize] = x;
+            t2 += 1;
+        }
+        while b2 > b1 && b2 >= t2 {
+            ss[b2 as usize] = x;
+            b2 -= 1;
+        }
+    }
 }
-while b1 > b2 && b1 >= t1 {
-R_MapPlane(b1, *ss_ptr.add(b1 as usize), x - 1);
-b1 -= 1;
-}
-while t2 < t1 && t2 <= b2 {
-*ss_ptr.add(t2 as usize) = x;
-t2 += 1;
-}
-while b2 > b1 && b2 >= t2 {
-*ss_ptr.add(b2 as usize) = x;
-b2 -= 1;
-}
-}
-}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_DrawPlanes() {
 unsafe {
@@ -386,51 +383,43 @@ doom_error(&format!(
 lastopening.offset_from(op_base)
 ));
 }
-let mut pl = vp_base;
-while pl < lastvisplane {
-if (*pl).minx > (*pl).maxx {
-pl = pl.add(1);
+let vp_count = lastvisplane.offset_from(vp_base).max(0) as usize;
+let vps = std::slice::from_raw_parts_mut(vp_base, vp_count);
+let xtv = (&raw const xtoviewangle).as_ref().unwrap();
+let zlight_arr = (&raw const zlight).as_ref().unwrap();
+for vp in vps {
+if vp.minx > vp.maxx {
 continue;
 }
-let top_ptr = (&raw mut (*pl).top) as *mut u8;
-let bot_ptr = (&raw const (*pl).bottom) as *const u8;
-// Отрисовка неба
-if (*pl).picnum == skyflatnum {
+if vp.picnum == get_sky_flat_num() {
 dc_iscale = pspriteiscale >> detailshift;
 dc_colormap = colormaps;
-dc_texturemid = skytexturemid;
-let xtv_ptr = (&raw const xtoviewangle) as *const u32;
-for x in (*pl).minx..=(*pl).maxx {
+dc_texturemid = get_sky_texture_mid();
+for x in vp.minx..=vp.maxx {
 let xu = x as usize;
-dc_yl = *top_ptr.add(xu) as c_int;
-dc_yh = *bot_ptr.add(xu) as c_int;
+dc_yl = vp.top[xu] as c_int;
+dc_yh = vp.bottom[xu] as c_int;
 if dc_yl <= dc_yh {
-let angle = (viewangle.wrapping_add(*xtv_ptr.add(xu)) >> ANGLETOSKYSHIFT) as c_int;
+let angle = (viewangle.wrapping_add(xtv[xu]) >> ANGLETOSKYSHIFT) as c_int;
 dc_x = x;
-dc_source = R_GetColumn(skytexture, angle);
+dc_source = R_GetColumn(get_sky_texture(), angle);
 if let Some(func) = colfunc {
 func();
 }
 }
 }
-pl = pl.add(1);
 continue;
 }
-// Отрисовка обычного пола или потолка
-let flat_idx = firstflat + *flattranslation.add((*pl).picnum as usize);
+let flat_idx = firstflat + *flattranslation.add(vp.picnum as usize);
 ds_source = W_CacheLumpNum(flat_idx, PU_STATIC) as *mut u8;
-planeheight = ((*pl).height - viewz).abs();
-let mut light = ((*pl).lightlevel >> LIGHTSEGSHIFT) + extralight;
-if light >= LIGHTLEVELS as c_int {
-light = (LIGHTLEVELS as c_int) - 1;
-}
-if light < 0 {
-light = 0;
-}
-let zlight_ptr = (&raw const zlight) as *const [*mut u8; MAXLIGHTZ as usize];
-planezlight = (*zlight_ptr.add(light as usize)).as_ptr() as *mut *mut u8;
-let minx = (*pl).minx;
-let maxx = (*pl).maxx;
+planeheight = (vp.height - viewz).abs();
+let light = (((vp.lightlevel >> LIGHTSEGSHIFT) + extralight)
+.clamp(0, (LIGHTLEVELS as c_int) - 1)) as usize;
+planezlight = zlight_arr[light].as_ptr() as *mut *mut u8;
+let minx = vp.minx;
+let maxx = vp.maxx;
+let top_ptr = vp.top.as_mut_ptr();
+let bot_ptr = vp.bottom.as_ptr();
 *top_ptr.offset((maxx + 1) as isize) = 0xff;
 *top_ptr.offset((minx - 1) as isize) = 0xff;
 let stop = maxx + 1;
@@ -446,7 +435,6 @@ x,
 );
 }
 Z_ChangeTag2(ds_source as *mut c_void, PU_CACHE);
-pl = pl.add(1);
 }
 }
 }

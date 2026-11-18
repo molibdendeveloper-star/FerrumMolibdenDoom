@@ -1,28 +1,33 @@
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, static_mut_refs)]
 
 pub use crate::bindings::*;
+use crate::doomstat::get_gamemode;
 use crate::r_segs::line_s;
 use crate::r_things::{player_s, player_t};
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::hu_stuff::hu_font;
 use crate::info::{mobjinfo, states};
 use crate::m_misc::HU_FONTSIZE;
 use crate::r_data::firstspritelump;
 use crate::r_things::sprites;
+use crate::v_video::{V_DrawPatch, V_DrawPatchFlipped, V_MarkRect, screens};
+use crate::w_wad::{W_CacheLumpName, W_CacheLumpNum};
+use crate::z_zone::{PU_CACHE, PU_LEVEL};
+
 const mus_victor: u32 = 31;
 const mus_bunny: u32 = 30;
 const mus_read_m: u32 = 67;
 const mus_evil: u32 = 65;
-use crate::v_video::{V_DrawPatch, V_DrawPatchFlipped, V_MarkRect, column_t, screens};
-use crate::w_wad::{W_CacheLumpName, W_CacheLumpNum};
-use crate::z_zone::{PU_CACHE, PU_LEVEL};
 
 const TEXTSPEED: c_int = 3;
 const TEXTWAIT: c_int = 250;
 const NUM_PLAYERS: usize = MAXPLAYERS as usize;
+const SCR_W: usize = SCREENWIDTH as usize;
+const SCR_H: usize = SCREENHEIGHT as usize;
 
 const E1TEXT_STR: &[u8] = b"Once you beat the big badasses and\nclean out the moon base you're supposed\nto win, aren't you? Aren't you? Where's\nyour fat reward and ticket home? What\nthe hell is this? It's not supposed to\nend this way!\n\nIt stinks like rotten meat, but looks\nlike the lost Deimos base.  Looks like\nyou're stuck on The Shores of Hell.\nThe only way out is through.\n\nTo continue the DOOM experience, play\nThe Shores of Hell and its amazing\nsequel, Inferno!\n\0";
 const E2TEXT_STR: &[u8] = b"You've done it! The hideous cyber-\ndemon lord that ruled the lost Deimos\nmoon base has been slain and you\nare triumphant! But ... where are\nyou? You clamber to the edge of the\nmoon and look down to see the awful\ntruth.\n\nDeimos floats above Hell itself!\nYou've never heard of anyone escaping\nfrom Hell, but you'll make the bastards\nsorry they ever heard of you! Quickly,\nyou rappel down to  the surface of\nHell.\n\nNow, it's on to the final chapter of\nDOOM! -- Inferno.\0";
@@ -46,13 +51,11 @@ unsafe extern "C" {
     static mut wipegamestate: gamestate_t;
     static mut viewactive: c_int;
     static mut automapactive: c_int;
-    static mut gamemode: GameMode_t;
     static mut gameepisode: c_int;
     static mut gamemap: c_int;
     static mut players: [player_t; NUM_PLAYERS];
 }
 
-// --- Глобальные переменные f_finale.c ---
 #[unsafe(no_mangle)]
 pub static mut finalestage: c_int = 0;
 
@@ -87,7 +90,6 @@ pub static mut finaletext: *mut c_char = ptr::null_mut();
 #[unsafe(no_mangle)]
 pub static mut finaleflat: *mut c_char = ptr::null_mut();
 
-// --- F_StartFinale ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn F_StartFinale() {
     unsafe {
@@ -96,7 +98,7 @@ pub unsafe extern "C" fn F_StartFinale() {
         viewactive = 0;
         automapactive = 0;
 
-        match gamemode {
+        match get_gamemode() {
             shareware | registered | retail => {
                 S_ChangeMusic(mus_victor as c_int, 1);
                 match gameepisode {
@@ -161,30 +163,20 @@ pub unsafe extern "C" fn F_StartFinale() {
     }
 }
 
-// --- F_Responder ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn F_Responder(event: *mut event_t) -> c_int {
-    unsafe {
-        if finalestage == 2 {
-            return F_CastResponder(event);
-        }
-        0
+    if unsafe { finalestage == 2 } {
+        return unsafe { F_CastResponder(event) };
     }
+    0
 }
 
-// --- F_Ticker ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn F_Ticker() {
-    unsafe {
-        if gamemode == commercial && finalecount > 50 {
-let players_base = (&raw const players) as *const player_t;
-let mut any_button = false;
-for i in 0..NUM_PLAYERS {
-if (*players_base.add(i)).cmd[7] != 0 {
-any_button = true;
-break;
-}
-}
+unsafe {
+if get_gamemode() == commercial && finalecount > 50 {
+let players_arr = (&raw const players).as_ref().unwrap();
+let any_button = players_arr.iter().any(|p| p.cmd[7] != 0);
 if any_button {
 if gamemap == 30 {
 F_StartCast();
@@ -198,7 +190,7 @@ if finalestage == 2 {
 F_CastTicker();
 return;
 }
-if gamemode == commercial {
+if get_gamemode() == commercial {
 return;
 }
 let text_len = if !finaletext.is_null() {
@@ -216,41 +208,33 @@ S_StartMusic(mus_bunny as c_int);
 }
 }
 }
-// --- F_TextWrite ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn F_TextWrite() {
 unsafe {
-let src = W_CacheLumpName(finaleflat, PU_CACHE) as *const u8;
-let scr_ptr = (&raw const screens) as *const *mut u8;
-let mut dest = *scr_ptr;
-let scr_w = SCREENWIDTH as usize;
-let scr_h = SCREENHEIGHT as usize;
-for y in 0..scr_h {
-let row_src = src.add((y & 63) << 6);
-for _ in 0..(scr_w / 64) {
-ptr::copy_nonoverlapping(row_src, dest, 64);
-dest = dest.add(64);
-}
-if (scr_w & 63) != 0 {
-ptr::copy_nonoverlapping(row_src, dest, scr_w & 63);
-dest = dest.add(scr_w & 63);
+let src_ptr = W_CacheLumpName(finaleflat, PU_CACHE) as *const u8;
+let src = std::slice::from_raw_parts(src_ptr, 64 * 64);
+let scr0 = *(&raw const screens as *const *mut u8);
+let dst = std::slice::from_raw_parts_mut(scr0, SCR_W * SCR_H);
+for y in 0..SCR_H {
+let row_src = &src[((y & 63) << 6)..((y & 63) << 6) + 64];
+let dst_row = &mut dst[y * SCR_W..(y + 1) * SCR_W];
+for chunk in dst_row.chunks_mut(64) {
+chunk.copy_from_slice(&row_src[..chunk.len()]);
 }
 }
 V_MarkRect(0, 0, SCREENWIDTH as c_int, SCREENHEIGHT as c_int);
 let mut cx = 10;
 let mut cy = 10;
-let mut ch = finaletext;
-let mut count = (finalecount - 10) / TEXTSPEED;
-if count < 0 {
-count = 0;
+let mut count = ((finalecount - 10) / TEXTSPEED).max(0) as usize;
+if finaletext.is_null() {
+return;
 }
-let font_base = (&raw const hu_font) as *const *mut patch_t;
+let bytes = CStr::from_ptr(finaletext).to_bytes();
+let font = (&raw const hu_font).as_ref().unwrap();
 let f_start = HU_FONTSTART as c_int;
 let f_size = HU_FONTSIZE as c_int;
-while count > 0 && !ch.is_null() {
-count -= 1;
-let c_raw = *ch as u8;
-ch = ch.add(1);
+for &c_raw in bytes.iter().take(count) {
+let _ = &mut count;
 if c_raw == 0 {
 break;
 }
@@ -264,7 +248,7 @@ if c < 0 || c > f_size {
 cx += 4;
 continue;
 }
-let patch = *font_base.add(c as usize);
+let patch = font[c as usize];
 let w = (*patch).width as c_int;
 if cx + w > (SCREENWIDTH as c_int) {
 break;
@@ -274,33 +258,32 @@ cx += w;
 }
 }
 }
-// --- Cast (DOOM II Finale) ---
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct castinfo_t {
-pub name: *mut c_char,
+pub name: *const c_char,
 pub m_type: mobjtype_t,
 }
-#[unsafe(no_mangle)]
-pub static mut castorder: [castinfo_t; 18] = [
-castinfo_t { name: CC_ZOMBIE.as_ptr() as *mut c_char, m_type: MT_POSSESSED },
-castinfo_t { name: CC_SHOTGUN.as_ptr() as *mut c_char, m_type: MT_SHOTGUY },
-castinfo_t { name: CC_HEAVY.as_ptr() as *mut c_char, m_type: MT_CHAINGUY },
-castinfo_t { name: CC_IMP.as_ptr() as *mut c_char, m_type: MT_TROOP },
-castinfo_t { name: CC_DEMON.as_ptr() as *mut c_char, m_type: MT_SERGEANT },
-castinfo_t { name: CC_LOST.as_ptr() as *mut c_char, m_type: MT_SKULL },
-castinfo_t { name: CC_CACO.as_ptr() as *mut c_char, m_type: MT_HEAD },
-castinfo_t { name: CC_HELL.as_ptr() as *mut c_char, m_type: MT_KNIGHT },
-castinfo_t { name: CC_BARON.as_ptr() as *mut c_char, m_type: MT_BRUISER },
-castinfo_t { name: CC_ARACH.as_ptr() as *mut c_char, m_type: MT_BABY },
-castinfo_t { name: CC_PAIN.as_ptr() as *mut c_char, m_type: MT_PAIN },
-castinfo_t { name: CC_REVEN.as_ptr() as *mut c_char, m_type: MT_UNDEAD },
-castinfo_t { name: CC_MANCU.as_ptr() as *mut c_char, m_type: MT_FATSO },
-castinfo_t { name: CC_ARCH.as_ptr() as *mut c_char, m_type: MT_VILE },
-castinfo_t { name: CC_SPIDER.as_ptr() as *mut c_char, m_type: MT_SPIDER },
-castinfo_t { name: CC_CYBER.as_ptr() as *mut c_char, m_type: MT_CYBORG },
-castinfo_t { name: CC_HERO.as_ptr() as *mut c_char, m_type: MT_PLAYER },
-castinfo_t { name: ptr::null_mut(), m_type: 0 },
+unsafe impl Sync for castinfo_t {}
+pub static CAST_ORDER: [castinfo_t; 18] = [
+castinfo_t { name: CC_ZOMBIE.as_ptr() as *const c_char, m_type: MT_POSSESSED },
+castinfo_t { name: CC_SHOTGUN.as_ptr() as *const c_char, m_type: MT_SHOTGUY },
+castinfo_t { name: CC_HEAVY.as_ptr() as *const c_char, m_type: MT_CHAINGUY },
+castinfo_t { name: CC_IMP.as_ptr() as *const c_char, m_type: MT_TROOP },
+castinfo_t { name: CC_DEMON.as_ptr() as *const c_char, m_type: MT_SERGEANT },
+castinfo_t { name: CC_LOST.as_ptr() as *const c_char, m_type: MT_SKULL },
+castinfo_t { name: CC_CACO.as_ptr() as *const c_char, m_type: MT_HEAD },
+castinfo_t { name: CC_HELL.as_ptr() as *const c_char, m_type: MT_KNIGHT },
+castinfo_t { name: CC_BARON.as_ptr() as *const c_char, m_type: MT_BRUISER },
+castinfo_t { name: CC_ARACH.as_ptr() as *const c_char, m_type: MT_BABY },
+castinfo_t { name: CC_PAIN.as_ptr() as *const c_char, m_type: MT_PAIN },
+castinfo_t { name: CC_REVEN.as_ptr() as *const c_char, m_type: MT_UNDEAD },
+castinfo_t { name: CC_MANCU.as_ptr() as *const c_char, m_type: MT_FATSO },
+castinfo_t { name: CC_ARCH.as_ptr() as *const c_char, m_type: MT_VILE },
+castinfo_t { name: CC_SPIDER.as_ptr() as *const c_char, m_type: MT_SPIDER },
+castinfo_t { name: CC_CYBER.as_ptr() as *const c_char, m_type: MT_CYBORG },
+castinfo_t { name: CC_HERO.as_ptr() as *const c_char, m_type: MT_PLAYER },
+castinfo_t { name: ptr::null(), m_type: 0 },
 ];
 #[unsafe(no_mangle)]
 pub static mut castnum: c_int = 0;
@@ -321,12 +304,11 @@ pub unsafe extern "C" fn F_StartCast() {
 unsafe {
 wipegamestate = -1i32 as gamestate_t;
 castnum = 0;
-let order_ptr = (&raw const castorder) as *const castinfo_t;
-let info_base = (&raw const mobjinfo) as *const mobjinfo_t;
-let states_base = (&raw mut states) as *mut state_t;
-let m_type = (*order_ptr).m_type as usize;
-let see_st = (*info_base.add(m_type)).seestate as usize;
-caststate = states_base.add(see_st);
+let info_arr = (&raw const mobjinfo).as_ref().unwrap();
+let states_arr = (&raw mut states).as_mut().unwrap();
+let m_type = CAST_ORDER[0].m_type as usize;
+let see_st = info_arr[m_type].seestate as usize;
+caststate = &mut states_arr[see_st];
 casttics = (*caststate).tics as c_int;
 castdeath = 0;
 finalestage = 2;
@@ -343,29 +325,28 @@ casttics -= 1;
 if casttics > 0 {
 return;
 }
-let order_ptr = (&raw const castorder) as *const castinfo_t;
-let info_base = (&raw const mobjinfo) as *const mobjinfo_t;
-let states_base = (&raw mut states) as *mut state_t;
+let info_arr = (&raw const mobjinfo).as_ref().unwrap();
+let states_arr = (&raw mut states).as_mut().unwrap();
 if (*caststate).tics == -1 || (*caststate).nextstate == S_NULL {
 castnum += 1;
 castdeath = 0;
-if (*order_ptr.add(castnum as usize)).name.is_null() {
+if CAST_ORDER[castnum as usize].name.is_null() {
 castnum = 0;
 }
-let m_type = (*order_ptr.add(castnum as usize)).m_type as usize;
-let see_snd = (*info_base.add(m_type)).seesound;
+let m_type = CAST_ORDER[castnum as usize].m_type as usize;
+let see_snd = info_arr[m_type].seesound;
 if see_snd != 0 {
 S_StartSound(ptr::null_mut(), see_snd);
 }
-let see_st = (*info_base.add(m_type)).seestate as usize;
-caststate = states_base.add(see_st);
+let see_st = info_arr[m_type].seestate as usize;
+caststate = &mut states_arr[see_st];
 castframes = 0;
 } else {
-if caststate == states_base.add(S_PLAY_ATK1 as usize) {
+if caststate == (&mut states_arr[S_PLAY_ATK1 as usize] as *mut state_t) {
 castattacking = 0;
 castframes = 0;
-let m_type = (*order_ptr.add(castnum as usize)).m_type as usize;
-caststate = states_base.add((*info_base.add(m_type)).seestate as usize);
+let m_type = CAST_ORDER[castnum as usize].m_type as usize;
+caststate = &mut states_arr[info_arr[m_type].seestate as usize];
 casttics = (*caststate).tics as c_int;
 if casttics == -1 {
 casttics = 15;
@@ -373,7 +354,7 @@ casttics = 15;
 return;
 }
 let st = (*caststate).nextstate;
-caststate = states_base.add(st as usize);
+caststate = &mut states_arr[st as usize];
 castframes += 1;
 let sfx = match st {
 S_PLAY_ATK1 => sfx_dshtgn as c_int,
@@ -399,30 +380,31 @@ if sfx != 0 {
 S_StartSound(ptr::null_mut(), sfx);
 }
 }
-let m_type = (*order_ptr.add(castnum as usize)).m_type as usize;
-let info = info_base.add(m_type);
+let m_type = CAST_ORDER[castnum as usize].m_type as usize;
+let info = &info_arr[m_type];
 if castframes == 12 {
 castattacking = 1;
-if castonmelee != 0 {
-caststate = states_base.add((*info).meleestate as usize);
+caststate = if castonmelee != 0 {
+&mut states_arr[info.meleestate as usize]
 } else {
-caststate = states_base.add((*info).missilestate as usize);
-}
+&mut states_arr[info.missilestate as usize]
+};
 castonmelee ^= 1;
-if caststate == states_base.add(S_NULL as usize) {
-if castonmelee != 0 {
-caststate = states_base.add((*info).meleestate as usize);
+if caststate == (&mut states_arr[S_NULL as usize] as *mut state_t) {
+caststate = if castonmelee != 0 {
+&mut states_arr[info.meleestate as usize]
 } else {
-caststate = states_base.add((*info).missilestate as usize);
-}
+&mut states_arr[info.missilestate as usize]
+};
 }
 }
 if castattacking != 0
-&& (castframes == 24 || caststate == states_base.add((*info).seestate as usize))
+&& (castframes == 24
+|| caststate == (&mut states_arr[info.seestate as usize] as *mut state_t))
 {
 castattacking = 0;
 castframes = 0;
-caststate = states_base.add((*info).seestate as usize);
+caststate = &mut states_arr[info.seestate as usize];
 }
 casttics = (*caststate).tics as c_int;
 if casttics == -1 {
@@ -432,49 +414,52 @@ casttics = 15;
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn F_CastResponder(ev: *mut event_t) -> c_int {
-unsafe {
-if (*ev).type_ != ev_keydown {
+let Some(ev_ref) = (unsafe { ev.as_ref() }) else {
+return 0;
+};
+if ev_ref.type_ != ev_keydown {
 return 0;
 }
+unsafe {
 if castdeath != 0 {
 return 1;
 }
 castdeath = 1;
-let order_ptr = (&raw const castorder) as *const castinfo_t;
-let info_base = (&raw const mobjinfo) as *const mobjinfo_t;
-let states_base = (&raw mut states) as *mut state_t;
-let m_type = (*order_ptr.add(castnum as usize)).m_type as usize;
-let info = info_base.add(m_type);
-caststate = states_base.add((*info).deathstate as usize);
+let info_arr = (&raw const mobjinfo).as_ref().unwrap();
+let states_arr = (&raw mut states).as_mut().unwrap();
+let m_type = CAST_ORDER[castnum as usize].m_type as usize;
+let info = &info_arr[m_type];
+caststate = &mut states_arr[info.deathstate as usize];
 casttics = (*caststate).tics as c_int;
 castframes = 0;
 castattacking = 0;
-if (*info).deathsound != 0 {
-S_StartSound(ptr::null_mut(), (*info).deathsound);
+if info.deathsound != 0 {
+S_StartSound(ptr::null_mut(), info.deathsound);
 }
 1
 }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn F_CastPrint(text: *mut c_char) {
-unsafe {
+pub unsafe extern "C" fn F_CastPrint(text: *const c_char) {
 if text.is_null() {
 return;
 }
-let font_base = (&raw const hu_font) as *const *mut patch_t;
+unsafe {
+let font = (&raw const hu_font).as_ref().unwrap();
 let f_start = HU_FONTSTART as c_int;
 let f_size = HU_FONTSIZE as c_int;
 let bytes = CStr::from_ptr(text).to_bytes();
-let mut width = 0;
-for &b in bytes {
+let width: c_int = bytes
+.iter()
+.map(|&b| {
 let c = (b.to_ascii_uppercase() as c_int) - f_start;
 if c < 0 || c > f_size {
-width += 4;
+4
 } else {
-let p = *font_base.add(c as usize);
-width += (*p).width as c_int;
+(*font[c as usize]).width as c_int
 }
-}
+})
+.sum();
 let mut cx = 160 - width / 2;
 for &b in bytes {
 let c = (b.to_ascii_uppercase() as c_int) - f_start;
@@ -482,7 +467,7 @@ if c < 0 || c > f_size {
 cx += 4;
 continue;
 }
-let p = *font_base.add(c as usize);
+let p = font[c as usize];
 let w = (*p).width as c_int;
 V_DrawPatch(cx, 180, 0, p as *mut _);
 cx += w;
@@ -494,15 +479,14 @@ pub unsafe extern "C" fn F_CastDrawer() {
 unsafe {
 let bg = W_CacheLumpName(b"BOSSBACK\0".as_ptr() as *mut c_char, PU_CACHE) as *mut _;
 V_DrawPatch(0, 0, 0, bg);
-let order_ptr = (&raw const castorder) as *const castinfo_t;
-F_CastPrint((*order_ptr.add(castnum as usize)).name);
+F_CastPrint(CAST_ORDER[castnum as usize].name);
 let sprites_base = sprites as *const spritedef_t;
-let sprdef = sprites_base.add((*caststate).sprite as usize);
-let sprframe = (*sprdef)
+let sprdef = &*sprites_base.add((*caststate).sprite as usize);
+let sprframe = &*sprdef
 .spriteframes
 .add(((*caststate).frame & (FF_FRAMEMASK as i64)) as usize);
-let lump = (*sprframe).lump[0] as c_int;
-let flip = (*sprframe).flip[0];
+let lump = sprframe.lump[0] as c_int;
+let flip = sprframe.flip[0];
 let patch = W_CacheLumpNum(lump + firstspritelump, PU_CACHE) as *mut _;
 if flip != 0 {
 V_DrawPatchFlipped(160, 170, 0, patch);
@@ -513,28 +497,30 @@ V_DrawPatch(160, 170, 0, patch);
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn F_DrawPatchCol(x: c_int, patch: *mut patch_t, col: c_int) {
+let Some(p) = (unsafe { patch.as_ref() }) else { return };
 unsafe {
-let col_ofs = (&raw const (*patch).columnofs) as *const c_int;
-let ofs = *col_ofs.add(col as usize) as isize;
-let mut column = (patch as *const u8).offset(ofs) as *const column_t;
-let scr_ptr = (&raw const screens) as *const *mut u8;
-let desttop = (*scr_ptr).offset(x as isize);
-let scr_w = SCREENWIDTH as usize;
-while (*column).topdelta != 0xff {
-let mut source = (column as *const u8).add(3);
-let mut dest = desttop.add(((*column).topdelta as usize) * scr_w);
-let mut count = (*column).length as c_int;
-while count > 0 {
-*dest = *source;
-source = source.add(1);
-dest = dest.add(scr_w);
-count -= 1;
+let ofs = p.columnofs[col as usize] as usize;
+let patch_bytes = (patch as *const u8).add(ofs);
+let scr0 = *(&raw const screens as *const *mut u8);
+let dst = std::slice::from_raw_parts_mut(scr0, SCR_W * SCR_H);
+let xu = x as usize;
+let mut col_ofs = 0usize;
+loop {
+let topdelta = *patch_bytes.add(col_ofs);
+if topdelta == 0xff {
+break;
 }
-column = (column as *const u8).add(((*column).length as usize) + 4) as *const column_t;
+let length = *patch_bytes.add(col_ofs + 1) as usize;
+let src_col = std::slice::from_raw_parts(patch_bytes.add(col_ofs + 3), length);
+let start_y = topdelta as usize;
+for (row, &px) in src_col.iter().enumerate() {
+dst[(start_y + row) * SCR_W + xu] = px;
+}
+col_ofs += length + 4;
 }
 }
 }
-static mut LASTSTAGE: c_int = 0;
+static LAST_STAGE: AtomicI32 = AtomicI32::new(0);
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn F_BunnyScroll() {
 unsafe {
@@ -543,13 +529,7 @@ let p2 = W_CacheLumpName(b"PFUB1\0".as_ptr() as *mut c_char, PU_LEVEL) as *mut p
 let scr_w = SCREENWIDTH as c_int;
 let scr_h = SCREENHEIGHT as c_int;
 V_MarkRect(0, 0, scr_w, scr_h);
-let mut scrolled = 320 - (finalecount - 230) / 2;
-if scrolled > 320 {
-scrolled = 320;
-}
-if scrolled < 0 {
-scrolled = 0;
-}
+let scrolled = (320 - (finalecount - 230) / 2).clamp(0, 320);
 for x in 0..scr_w {
 if x + scrolled < 320 {
 F_DrawPatchCol(x, p1, x + scrolled);
@@ -565,16 +545,14 @@ let cy = (scr_h - 8 * 8) / 2;
 if finalecount < 1180 {
 let end0 = W_CacheLumpName(b"END0\0".as_ptr() as *mut c_char, PU_CACHE) as *mut _;
 V_DrawPatch(cx, cy, 0, end0);
-LASTSTAGE = 0;
+LAST_STAGE.store(0, Ordering::Relaxed);
 return;
 }
-let mut stage = (finalecount - 1180) / 5;
-if stage > 6 {
-stage = 6;
-}
-if stage > LASTSTAGE {
+let stage = ((finalecount - 1180) / 5).min(6);
+let prev = LAST_STAGE.load(Ordering::Relaxed);
+if stage > prev {
 S_StartSound(ptr::null_mut(), sfx_pistol as c_int);
-LASTSTAGE = stage;
+LAST_STAGE.store(stage, Ordering::Relaxed);
 }
 let name = format!("END{}\0", stage);
 let end_patch = W_CacheLumpName(name.as_ptr() as *mut c_char, PU_CACHE) as *mut _;
@@ -593,7 +571,7 @@ F_TextWrite();
 } else {
 match gameepisode {
 1 => {
-let lump = if gamemode == retail {
+let lump = if get_gamemode() == retail {
 b"CREDIT\0".as_ptr()
 } else {
 b"HELP2\0".as_ptr()

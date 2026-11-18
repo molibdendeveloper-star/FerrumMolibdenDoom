@@ -1,4 +1,6 @@
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, static_mut_refs)]
+use crate::i_system::{I_GetTime, I_WaitVBL};
+use crate::i_video::I_StartTic;
 
 pub use crate::bindings::*;
 use crate::r_segs::line_s;
@@ -7,6 +9,7 @@ use crate::r_things::{player_s, player_t};
 use std::ffi::{c_char, c_int, c_short, c_uint};
 use std::mem::{offset_of, size_of};
 use std::ptr;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::g_game::{
     G_BuildTiccmd, G_CheckDemoStatus, G_Ticker, consoleplayer, deathmatch, demoplayback,
@@ -33,12 +36,21 @@ const MAX_EVENTS: usize = 64;
 const CMD_SEND: c_short = 1;
 const CMD_GET: c_short = 2;
 
+const EMPTY_TICCMD: ticcmd_t = ticcmd_t {
+    forwardmove: 0,
+    sidemove: 0,
+    angleturn: 0,
+    consistancy: 0,
+    chatchar: 0,
+    buttons: 0,
+};
+
 unsafe extern "C" {
-    fn I_GetTime() -> c_int;
-    fn I_StartTic();
+    
+    
     fn I_NetCmd();
     fn I_InitNetwork();
-    fn I_WaitVBL(count: c_int);
+    
     fn D_ProcessEvents();
     fn D_DoAdvanceDemo();
 
@@ -56,7 +68,6 @@ unsafe extern "C" {
     static mut advancedemo: c_int;
 }
 
-// --- Глобальные переменные d_net.c ---
 #[unsafe(no_mangle)]
 pub static mut doomcom: *mut doomcom_t = ptr::null_mut();
 
@@ -64,10 +75,11 @@ pub static mut doomcom: *mut doomcom_t = ptr::null_mut();
 pub static mut netbuffer: *mut doomdata_t = ptr::null_mut();
 
 #[unsafe(no_mangle)]
-pub static mut localcmds: [ticcmd_t; BACKUP_TICS] = unsafe { std::mem::zeroed() };
+pub static mut localcmds: [ticcmd_t; BACKUP_TICS] = [EMPTY_TICCMD; BACKUP_TICS];
 
 #[unsafe(no_mangle)]
-pub static mut netcmds: [[ticcmd_t; BACKUP_TICS]; NUM_PLAYERS] = unsafe { std::mem::zeroed() };
+pub static mut netcmds: [[ticcmd_t; BACKUP_TICS]; NUM_PLAYERS] =
+    [[EMPTY_TICCMD; BACKUP_TICS]; NUM_PLAYERS];
 
 #[unsafe(no_mangle)]
 pub static mut nettics: [c_int; MAX_NETNODES] = [0; MAX_NETNODES];
@@ -106,7 +118,14 @@ pub static mut maxsend: c_int = 0;
 pub static mut reboundpacket: c_int = 0;
 
 #[unsafe(no_mangle)]
-pub static mut reboundstore: doomdata_t = unsafe { std::mem::zeroed() };
+pub static mut reboundstore: doomdata_t = doomdata_t {
+    checksum: 0,
+    retransmitfrom: 0,
+    starttic: 0,
+    player: 0,
+    numtics: 0,
+    cmds: [EMPTY_TICCMD; BACKUP_TICS],
+};
 
 #[unsafe(no_mangle)]
 pub static mut exitmsg: [c_char; 80] = [0; 80];
@@ -126,14 +145,23 @@ pub static mut frameskip: [c_int; 4] = [0; 4];
 #[unsafe(no_mangle)]
 pub static mut oldnettics: c_int = 0;
 
-// --- NetbufferSize / NetbufferChecksum / ExpandTics ---
+#[inline]
+pub fn expand_tics(low: c_int, cur_maketic: c_int) -> c_int {
+    let delta = low - (cur_maketic & 0xff);
+    if (-64..=64).contains(&delta) {
+        (cur_maketic & !0xff) + low
+    } else if delta > 64 {
+        (cur_maketic & !0xff) - 256 + low
+    } else {
+        (cur_maketic & !0xff) + 256 + low
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn NetbufferSize() -> c_int {
-    unsafe {
-        let header_sz = offset_of!(doomdata_t, cmds);
-        let num_tics = (*netbuffer).numtics as usize;
-        (header_sz + num_tics * size_of::<ticcmd_t>()) as c_int
-    }
+    let header_sz = offset_of!(doomdata_t, cmds);
+    let num_tics = unsafe { (*netbuffer).numtics as usize };
+    (header_sz + num_tics * size_of::<ticcmd_t>()) as c_int
 }
 
 #[unsafe(no_mangle)]
@@ -141,37 +169,29 @@ pub unsafe extern "C" fn NetbufferChecksum() -> c_uint {
     unsafe {
         let mut c: u32 = 0x1234567;
         let retr_ofs = offset_of!(doomdata_t, retransmitfrom) as c_int;
-        let l = (NetbufferSize() - retr_ofs) / 4;
+        let words = ((NetbufferSize() - retr_ofs) / 4).max(0) as usize;
         let ptr = (&raw const (*netbuffer).retransmitfrom) as *const u32;
-        for i in 0..(l as usize) {
-            c = c.wrapping_add((*ptr.add(i)).wrapping_mul((i as u32) + 1));
+        let slice = std::slice::from_raw_parts(ptr, words);
+        for (i, &w) in slice.iter().enumerate() {
+            c = c.wrapping_add(w.wrapping_mul((i as u32) + 1));
         }
         c & NCMD_CHECKSUM
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ExpandTics(low: c_int) -> c_int {
-    unsafe {
-        let delta = low - (maketic & 0xff);
-        if (-64..=64).contains(&delta) {
-            (maketic & !0xff) + low
-        } else if delta > 64 {
-            (maketic & !0xff) - 256 + low
-        } else {
-            (maketic & !0xff) + 256 + low
-        }
-    }
+pub extern "C" fn ExpandTics(low: c_int) -> c_int {
+    expand_tics(low, unsafe { maketic })
 }
 
-// --- HSendPacket / HGetPacket ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn HSendPacket(node: c_int, flags: c_int) {
     unsafe {
-        (*netbuffer).checksum = NetbufferChecksum() | (flags as u32);
+        let nb = &mut *netbuffer;
+        nb.checksum = NetbufferChecksum() | (flags as u32);
 
         if node == 0 {
-            ptr::copy_nonoverlapping(netbuffer, &raw mut reboundstore, 1);
+            reboundstore = *nb;
             reboundpacket = 1;
             return;
         }
@@ -184,9 +204,10 @@ pub unsafe extern "C" fn HSendPacket(node: c_int, flags: c_int) {
             doom_error("Tried to transmit to another node");
         }
 
-        (*doomcom).command = CMD_SEND as c_short;
-        (*doomcom).remotenode = node as c_short;
-        (*doomcom).datalength = NetbufferSize() as c_short;
+        let dc = &mut *doomcom;
+        dc.command = CMD_SEND as c_short;
+        dc.remotenode = node as c_short;
+        dc.datalength = NetbufferSize() as c_short;
 
         I_NetCmd();
     }
@@ -195,9 +216,12 @@ pub unsafe extern "C" fn HSendPacket(node: c_int, flags: c_int) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn HGetPacket() -> c_int {
     unsafe {
+        let nb = &mut *netbuffer;
+        let dc = &mut *doomcom;
+
         if reboundpacket != 0 {
-            ptr::copy_nonoverlapping(&raw const reboundstore, netbuffer, 1);
-            (*doomcom).remotenode = 0;
+            *nb = reboundstore;
+            dc.remotenode = 0;
             reboundpacket = 0;
             return 1;
         }
@@ -206,18 +230,18 @@ pub unsafe extern "C" fn HGetPacket() -> c_int {
             return 0;
         }
 
-        (*doomcom).command = CMD_GET as c_short;
+        dc.command = CMD_GET as c_short;
         I_NetCmd();
 
-        if (*doomcom).remotenode == -1 {
+        if dc.remotenode == -1 {
             return 0;
         }
 
-        if ((*doomcom).datalength as c_int) != NetbufferSize() {
+        if (dc.datalength as c_int) != NetbufferSize() {
             return 0;
         }
 
-        if NetbufferChecksum() != ((*netbuffer).checksum & NCMD_CHECKSUM) {
+        if NetbufferChecksum() != (nb.checksum & NCMD_CHECKSUM) {
             return 0;
         }
 
@@ -225,34 +249,39 @@ pub unsafe extern "C" fn HGetPacket() -> c_int {
     }
 }
 
-// --- GetPackets ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn GetPackets() {
     unsafe {
+        let nb = &*netbuffer;
+        let dc = &*doomcom;
+        let in_game = (&raw mut playeringame).as_mut().unwrap();
+        let players_arr = (&raw mut players).as_mut().unwrap();
+        let netcmds_arr = (&raw mut netcmds).as_mut().unwrap();
+
         while HGetPacket() != 0 {
-            if ((*netbuffer).checksum & NCMD_SETUP) != 0 {
+            if (nb.checksum & NCMD_SETUP) != 0 {
                 continue;
             }
 
-            let netconsole = (((*netbuffer).player) & !PL_DRONE) as usize;
-            let netnode = (*doomcom).remotenode as usize;
+            let netconsole = (nb.player & !PL_DRONE) as usize;
+            let netnode = dc.remotenode as usize;
 
-            let realstart = ExpandTics((*netbuffer).starttic as c_int);
-            let realend = realstart + ((*netbuffer).numtics as c_int);
+            let realstart = ExpandTics(nb.starttic as c_int);
+            let realend = realstart + (nb.numtics as c_int);
 
-            if ((*netbuffer).checksum & NCMD_EXIT) != 0 {
+            if (nb.checksum & NCMD_EXIT) != 0 {
                 if nodeingame[netnode] == 0 {
                     continue;
                 }
                 nodeingame[netnode] = 0;
-                let in_game_ptr = (&raw mut playeringame) as *mut c_int;
-                *in_game_ptr.add(netconsole) = 0;
+                in_game[netconsole] = 0;
 
                 let msg = format!("Player {} left the game\0", netconsole + 1);
-                let dst = (&raw mut exitmsg) as *mut c_char;
-                ptr::copy_nonoverlapping(msg.as_ptr() as *const c_char, dst, msg.len());
-                let players_base = (&raw mut players) as *mut player_t;
-                (*players_base.add(consoleplayer as usize)).message = dst;
+                let dst = (&raw mut exitmsg).as_mut().unwrap();
+                for (d, &s) in dst.iter_mut().zip(msg.as_bytes()) {
+                    *d = s as c_char;
+                }
+                players_arr[consoleplayer as usize].message = dst.as_mut_ptr();
 
                 if demorecording != 0 {
                     G_CheckDemoStatus();
@@ -260,14 +289,14 @@ pub unsafe extern "C" fn GetPackets() {
                 continue;
             }
 
-            if ((*netbuffer).checksum & NCMD_KILL) != 0 {
+            if (nb.checksum & NCMD_KILL) != 0 {
                 doom_error("Killed by network driver");
             }
 
             nodeforplayer[netconsole] = netnode as c_int;
 
-            if resendcount[netnode] <= 0 && ((*netbuffer).checksum & NCMD_RETRANSMIT) != 0 {
-                resendto[netnode] = ExpandTics((*netbuffer).retransmitfrom as c_int);
+            if resendcount[netnode] <= 0 && (nb.checksum & NCMD_RETRANSMIT) != 0 {
+                resendto[netnode] = ExpandTics(nb.retransmitfrom as c_int);
                 resendcount[netnode] = RESENDCOUNT;
             } else {
                 resendcount[netnode] -= 1;
@@ -283,22 +312,18 @@ pub unsafe extern "C" fn GetPackets() {
             }
 
             remoteresend[netnode] = 0;
-            let start = (nettics[netnode] - realstart) as usize;
-            let mut src = ((*netbuffer).cmds).as_ptr().add(start);
-            let netcmds_base = (&raw mut netcmds) as *mut [ticcmd_t; BACKUP_TICS];
+            let mut src_idx = (nettics[netnode] - realstart) as usize;
 
             while nettics[netnode] < realend {
                 let slot = (nettics[netnode] as usize) % BACKUP_TICS;
-                let dest = &raw mut (*netcmds_base.add(netconsole))[slot];
+                netcmds_arr[netconsole][slot] = nb.cmds[src_idx];
                 nettics[netnode] += 1;
-                ptr::copy_nonoverlapping(src, dest, 1);
-                src = src.add(1);
+                src_idx += 1;
             }
         }
     }
 }
 
-// --- NetUpdate ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn NetUpdate() {
     unsafe {
@@ -319,45 +344,45 @@ pub unsafe extern "C" fn NetUpdate() {
             newtics = 0;
         }
 
-        (*netbuffer).player = consoleplayer as u8;
+        let nb = &mut *netbuffer;
+        let dc = &*doomcom;
+        nb.player = consoleplayer as u8;
 
         let gameticdiv = gametic / ticdup;
-        let local_base = (&raw mut localcmds) as *mut ticcmd_t;
+        let local_arr = (&raw mut localcmds).as_mut().unwrap();
+
         for _ in 0..newtics {
             I_StartTic();
             D_ProcessEvents();
             if maketic - gameticdiv >= ((BACKUP_TICS as c_int) / 2) - 1 {
                 break;
             }
-            G_BuildTiccmd(local_base.add((maketic as usize) % BACKUP_TICS) as *mut _);
+            let slot = (maketic as usize) % BACKUP_TICS;
+            G_BuildTiccmd((&mut local_arr[slot] as *mut ticcmd_t) as *mut _);
             maketic += 1;
         }
-
-        if singletics != 0 {
-            return;
-        }
-
-        let num_nodes = (*doomcom).numnodes as usize;
-        for i in 0..num_nodes {
-            if nodeingame[i] != 0 {
-                let realstart = resendto[i];
-(*netbuffer).starttic = realstart as u8;
+if singletics != 0 {
+return;
+}
+let num_nodes = dc.numnodes as usize;
+for i in 0..num_nodes {
+if nodeingame[i] != 0 {
+let realstart = resendto[i];
+nb.starttic = realstart as u8;
 let n_tics = maketic - realstart;
-(*netbuffer).numtics = n_tics as u8;
+nb.numtics = n_tics as u8;
 if n_tics > (BACKUP_TICS as c_int) {
 doom_error("NetUpdate: netbuffer->numtics > BACKUPTICS");
 }
-resendto[i] = maketic - ((*doomcom).extratics as c_int);
-let cmds_dst = ((*netbuffer).cmds).as_mut_ptr();
+resendto[i] = maketic - (dc.extratics as c_int);
 for j in 0..(n_tics as usize) {
-let src_cmd = local_base.add(((realstart as usize) + j) % BACKUP_TICS);
-ptr::copy_nonoverlapping(src_cmd, cmds_dst.add(j), 1);
+nb.cmds[j] = local_arr[((realstart as usize) + j) % BACKUP_TICS];
 }
 if remoteresend[i] != 0 {
-(*netbuffer).retransmitfrom = nettics[i] as u8;
+nb.retransmitfrom = nettics[i] as u8;
 HSendPacket(i as c_int, NCMD_RETRANSMIT as c_int);
 } else {
-(*netbuffer).retransmitfrom = 0;
+nb.retransmitfrom = 0;
 HSendPacket(i as c_int, 0);
 }
 }
@@ -365,7 +390,6 @@ HSendPacket(i as c_int, 0);
 GetPackets();
 }
 }
-// --- CheckAbort / D_ArbitrateNetStart / D_CheckNetGame / D_QuitNetGame ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn CheckAbort() {
 unsafe {
@@ -374,9 +398,9 @@ while I_GetTime() < stoptic {
 I_StartTic();
 }
 I_StartTic();
-let ev_base = (&raw const events) as *const event_t;
+let ev_arr = (&raw const events).as_ref().unwrap();
 while eventtail != eventhead {
-let ev = &*ev_base.add(eventtail as usize);
+let ev = &ev_arr[eventtail as usize];
 if ev.type_ == ev_keydown && (ev.data1 as u32) == KEY_ESCAPE {
 doom_error("Network game synchronization aborted.");
 }
@@ -389,20 +413,22 @@ pub unsafe extern "C" fn D_ArbitrateNetStart() {
 unsafe {
 let mut gotinfo = [false; MAX_NETNODES];
 autostart = 1;
-let num_nodes = (*doomcom).numnodes as usize;
-if (*doomcom).consoleplayer != 0 {
+let dc = &*doomcom;
+let nb = &mut *netbuffer;
+let num_nodes = dc.numnodes as usize;
+if dc.consoleplayer != 0 {
 println!("listening for network start info...");
 loop {
 CheckAbort();
 if HGetPacket() == 0 {
 continue;
 }
-if ((*netbuffer).checksum & NCMD_SETUP) != 0 {
-if (*netbuffer).player != VERSION {
+if (nb.checksum & NCMD_SETUP) != 0 {
+if nb.player != VERSION {
 doom_error("Different DOOM versions cannot play a net game!");
 }
-let rf = (*netbuffer).retransmitfrom;
-let st = (*netbuffer).starttic;
+let rf = nb.retransmitfrom;
+let st = nb.starttic;
 startskill = (rf & 15) as skill_t;
 deathmatch = ((rf & 0xc0) >> 6) as c_int;
 nomonsters = ((rf & 0x20) > 0) as c_int;
@@ -427,29 +453,22 @@ rf |= 0x20;
 if respawnparm != 0 {
 rf |= 0x10;
 }
-(*netbuffer).retransmitfrom = rf;
-(*netbuffer).starttic = ((startepisode * 64 + startmap) as u8);
-(*netbuffer).player = VERSION;
-(*netbuffer).numtics = 0;
+nb.retransmitfrom = rf;
+nb.starttic = (startepisode * 64 + startmap) as u8;
+nb.player = VERSION;
+nb.numtics = 0;
 HSendPacket(i as c_int, NCMD_SETUP as c_int);
 }
 for _ in 0..10 {
 if HGetPacket() == 0 {
 break;
 }
-let idx = ((*netbuffer).player & 0x7f) as usize;
+let idx = (nb.player & 0x7f) as usize;
 if idx < MAX_NETNODES {
 gotinfo[idx] = true;
 }
 }
-let mut all_ready = true;
-for i in 1..num_nodes {
-if !gotinfo[i] {
-all_ready = false;
-break;
-}
-}
-if all_ready {
+if gotinfo[1..num_nodes].iter().all(|&ready| ready) {
 break;
 }
 }
@@ -459,18 +478,17 @@ break;
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn D_CheckNetGame() {
 unsafe {
-for i in 0..MAX_NETNODES {
-nodeingame[i] = 0;
-nettics[i] = 0;
-remoteresend[i] = 0;
-resendto[i] = 0;
-}
+nodeingame.fill(0);
+nettics.fill(0);
+remoteresend.fill(0);
+resendto.fill(0);
 I_InitNetwork();
-if (*doomcom).id != (DOOMCOM_ID as i64) {
+let dc = &mut *doomcom;
+if dc.id != (DOOMCOM_ID as i64) {
 doom_error("Doomcom buffer invalid!");
 }
-netbuffer = &raw mut (*doomcom).data;
-let cp = (*doomcom).consoleplayer as c_int;
+netbuffer = &raw mut dc.data;
+let cp = dc.consoleplayer as c_int;
 consoleplayer = cp;
 displayplayer = cp;
 if netgame != 0 {
@@ -480,23 +498,16 @@ println!(
 "startskill {}  deathmatch: {}  startmap: {}  startepisode: {}",
 startskill, deathmatch, startmap, startepisode
 );
-ticdup = (*doomcom).ticdup as c_int;
-maxsend = (BACKUP_TICS as c_int) / (2 * ticdup) - 1;
-if maxsend < 1 {
-maxsend = 1;
-}
-let in_game_ptr = (&raw mut playeringame) as *mut c_int;
-for i in 0..((*doomcom).numplayers as usize) {
-*in_game_ptr.add(i) = 1;
-}
-for i in 0..((*doomcom).numnodes as usize) {
-nodeingame[i] = 1;
-}
+ticdup = dc.ticdup as c_int;
+maxsend = ((BACKUP_TICS as c_int) / (2 * ticdup) - 1).max(1);
+let in_game = (&raw mut playeringame).as_mut().unwrap();
+in_game[..(dc.numplayers as usize)].fill(1);
+nodeingame[..(dc.numnodes as usize)].fill(1);
 println!(
 "player {} of {} ({} nodes)",
 consoleplayer + 1,
-(*doomcom).numplayers,
-(*doomcom).numnodes
+dc.numplayers,
+dc.numnodes
 );
 }
 }
@@ -506,9 +517,11 @@ unsafe {
 if netgame == 0 || usergame == 0 || consoleplayer == -1 || demoplayback != 0 {
 return;
 }
-(*netbuffer).player = consoleplayer as u8;
-(*netbuffer).numtics = 0;
-let num_nodes = (*doomcom).numnodes as usize;
+let nb = &mut *netbuffer;
+let dc = &*doomcom;
+nb.player = consoleplayer as u8;
+nb.numtics = 0;
+let num_nodes = dc.numnodes as usize;
 for _ in 0..4 {
 for j in 1..num_nodes {
 if nodeingame[j] != 0 {
@@ -519,16 +532,16 @@ I_WaitVBL(1);
 }
 }
 }
-// --- TryRunTics ---
-static mut OLD_ENTERTICS: c_int = 0;
+static OLD_ENTERTICS: AtomicI32 = AtomicI32::new(0);
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn TryRunTics() {
 unsafe {
 let entertic = I_GetTime() / ticdup;
-let realtics = entertic - OLD_ENTERTICS;
-OLD_ENTERTICS = entertic;
+let prev_enter = OLD_ENTERTICS.swap(entertic, Ordering::Relaxed);
+let realtics = entertic - prev_enter;
 NetUpdate();
-let num_nodes = (*doomcom).numnodes as usize;
+let dc = &*doomcom;
+let num_nodes = dc.numnodes as usize;
 let mut lowtic = MAX_INT;
 for i in 0..num_nodes {
 if nodeingame[i] != 0 && nettics[i] < lowtic {
@@ -536,26 +549,18 @@ lowtic = nettics[i];
 }
 }
 let availabletics = lowtic - gametic / ticdup;
-let mut counts = if realtics < availabletics - 1 {
+let counts = if realtics < availabletics - 1 {
 realtics + 1
 } else if realtics < availabletics {
 realtics
 } else {
 availabletics
-};
-if counts < 1 {
-counts = 1;
 }
+.max(1);
 frameon += 1;
 if demoplayback == 0 {
-let in_game_ptr = (&raw const playeringame) as *const c_int;
-let mut key_p = 0usize;
-for i in 0..NUM_PLAYERS {
-if *in_game_ptr.add(i) != 0 {
-key_p = i;
-break;
-}
-}
+let in_game = (&raw const playeringame).as_ref().unwrap();
+let key_p = in_game.iter().position(|&v| v != 0).unwrap_or(0);
 if consoleplayer != (key_p as c_int) {
 let node_idx = nodeforplayer[key_p] as usize;
 if nettics[0] <= nettics[node_idx] {
@@ -563,8 +568,7 @@ gametime -= 1;
 }
 frameskip[(frameon as usize) & 3] = (oldnettics > nettics[node_idx]) as c_int;
 oldnettics = nettics[0];
-                if frameskip.iter().all(|&x| x != 0)
-{
+if frameskip.iter().all(|&x| x != 0) {
 skiptics = 1;
 }
 }
@@ -585,9 +589,8 @@ M_Ticker();
 return;
 }
 }
-let netcmds_base = (&raw mut netcmds) as *mut [ticcmd_t; BACKUP_TICS];
-while counts > 0 {
-counts -= 1;
+let netcmds_arr = (&raw mut netcmds).as_mut().unwrap();
+for _ in 0..counts {
 for i in 0..ticdup {
 if gametic / ticdup > lowtic {
 doom_error("gametic>lowtic");
@@ -600,11 +603,11 @@ G_Ticker();
 gametic += 1;
 if i != ticdup - 1 {
 let buf = ((gametic / ticdup) as usize) % BACKUP_TICS;
-for j in 0..NUM_PLAYERS {
-let cmd = &raw mut (*netcmds_base.add(j))[buf];
-(*cmd).chatchar = 0;
-if (((*cmd).buttons as u32) & BT_SPECIAL) != 0 {
-(*cmd).buttons = 0;
+for p_cmds in netcmds_arr.iter_mut() {
+let cmd = &mut p_cmds[buf];
+cmd.chatchar = 0;
+if ((cmd.buttons as u32) & BT_SPECIAL) != 0 {
+cmd.buttons = 0;
 }
 }
 }

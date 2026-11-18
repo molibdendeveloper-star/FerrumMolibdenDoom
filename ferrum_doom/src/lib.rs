@@ -1,5 +1,4 @@
 pub mod bindings;
-use std::ffi::{CStr, c_char, c_int, c_ulong, c_ushort};
 
 pub mod m_argv;
 pub mod m_bbox;
@@ -64,74 +63,3 @@ pub mod i_net;
 pub mod i_system;
 pub mod i_main;
 pub mod mus2mid;
-
-// --- m_fixed ---
-#[unsafe(no_mangle)]
-pub extern "C" fn FixedMul(a: i32, b: i32) -> i32 {
-    m_fixed::fixed_mul(a, b)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn FixedDiv(a: i32, b: i32) -> i32 {
-    m_fixed::fixed_div(a, b)
-}
-
-// --- m_random ---
-#[unsafe(no_mangle)]
-pub extern "C" fn P_Random() -> c_int {
-    m_random::p_random()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn M_Random() -> c_int {
-    m_random::m_random()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn M_ClearRandom() {
-    m_random::m_clear_random();
-}
-
-// --- m_argv ---
-#[unsafe(no_mangle)]
-pub extern "C" fn M_CheckParm(check: *const c_char) -> c_int {
-    if check.is_null() {
-        return 0;
-    }
-
-    let c_str = unsafe { CStr::from_ptr(check) };
-    match c_str.to_str() {
-        Ok(s) => m_argv::m_check_parm(s),
-        Err(_) => 0,
-    }
-}
-
-// --- m_bbox ---
-#[unsafe(no_mangle)]
-pub extern "C" fn M_ClearBox(box_ptr: *mut i32) {
-    if box_ptr.is_null() {
-        return;
-    }
-    let box_arr = unsafe { &mut *(box_ptr as *mut [i32; 4]) };
-    m_bbox::m_clear_box(box_arr);
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn M_AddToBox(box_ptr: *mut i32, x: i32, y: i32) {
-    if box_ptr.is_null() {
-        return;
-    }
-    let box_arr = unsafe { &mut *(box_ptr as *mut [i32; 4]) };
-    m_bbox::m_add_to_box(box_arr, x, y);
-}
-
-// --- m_swap ---
-#[unsafe(no_mangle)]
-pub extern "C" fn SwapSHORT(x: c_ushort) -> c_ushort {
-    m_swap::swap_short(x)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn SwapLONG(x: c_ulong) -> c_ulong {
-    m_swap::swap_long(x as u32) as c_ulong
-}

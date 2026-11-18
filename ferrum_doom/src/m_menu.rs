@@ -1,9 +1,12 @@
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, static_mut_refs)]
 
 pub use crate::bindings::*;
+use crate::doomstat::{get_gamemode, get_language};
 use crate::r_segs::line_s;
 use crate::r_things::{player_s, player_t};
 
+use crate::i_system::{I_GetTime, I_Quit, I_WaitVBL};
+use crate::i_video::I_SetPalette;
 use std::ffi::{CStr, CString, c_char, c_int, c_short, c_void};
 use std::fs::File;
 use std::io::Read;
@@ -74,10 +77,10 @@ unsafe extern "C" {
     fn G_DeferedInitNew(skill: skill_t, episode: c_int, map: c_int);
     fn G_ScreenShot();
     fn D_StartTitle();
-    fn I_WaitVBL(count: c_int);
-    fn I_Quit();
-    fn I_SetPalette(palette: *mut u8);
-    fn I_GetTime() -> c_int;
+    
+    
+    
+    
 
     static mut hu_font: [*mut patch_t; HU_FONTSIZE as usize];
     static mut message_dontfuckwithme: c_int;
@@ -86,7 +89,6 @@ unsafe extern "C" {
     static mut netgame: c_int;
     static mut usergame: c_int;
     static mut gamestate: gamestate_t;
-    static mut gamemode: GameMode_t;
     static mut demoplayback: c_int;
     static mut automapactive: c_int;
     static mut devparm: c_int;
@@ -95,8 +97,7 @@ unsafe extern "C" {
     static mut players: [player_t; NUM_PLAYERS];
     static mut snd_SfxVolume: c_int;
     static mut snd_MusicVolume: c_int;
-    static mut language: Language_t;
-    static mut endmsg: [*const c_char; NUM_QUITMESSAGES as usize];
+    // endmsg imported safely from crate::dstrings
     static mut usegamma: c_int;
 }
 
@@ -590,7 +591,7 @@ M_StartMessage(tmp_ptr, M_QuickLoadResponse as *mut c_void, 1);
 pub unsafe extern "C" fn M_DrawReadThis1() {
 unsafe {
 inhelpscreens = 1;
-match gamemode {
+match get_gamemode() {
 commercial => draw_lump(0, 0, b"HELP\0"),
 shareware | registered | retail => draw_lump(0, 0, b"HELP1\0"),
 _ => {}
@@ -601,7 +602,7 @@ _ => {}
 pub unsafe extern "C" fn M_DrawReadThis2() {
 unsafe {
 inhelpscreens = 1;
-match gamemode {
+match get_gamemode() {
 retail | commercial => draw_lump(0, 0, b"CREDIT\0"),
 shareware | registered => draw_lump(0, 0, b"HELP2\0"),
 _ => {}
@@ -672,7 +673,7 @@ if netgame != 0 && demoplayback == 0 {
 M_StartMessage(NEWGAME.as_ptr() as *mut c_char, ptr::null_mut(), 0);
 return;
 }
-if gamemode == commercial {
+if get_gamemode() == commercial {
 M_SetupNextMenu(&raw mut NewDef);
 } else {
 M_SetupNextMenu(&raw mut EpiDef);
@@ -713,12 +714,12 @@ M_ClearMenus();
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn M_Episode(mut choice: c_int) {
 unsafe {
-if gamemode == shareware && choice != 0 {
+if get_gamemode() == shareware && choice != 0 {
 M_StartMessage(SWSTRING.as_ptr() as *mut c_char, ptr::null_mut(), 0);
 M_SetupNextMenu(&raw mut ReadDef1);
 return;
 }
-if gamemode == registered && choice > 2 {
+if get_gamemode() == registered && choice > 2 {
 eprintln!("M_Episode: 4th episode requires UltimateDOOM");
 choice = 0;
 }
@@ -839,7 +840,7 @@ return;
 }
 if netgame == 0 {
 let idx = ((gametic >> 2) & 7) as usize;
-let snd = if gamemode == commercial {
+let snd = if get_gamemode() == commercial {
 *(&raw const quitsounds2 as *const c_int).add(idx)
 } else {
 *(&raw const quitsounds as *const c_int).add(idx)
@@ -853,13 +854,12 @@ I_Quit();
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn M_QuitDOOM(_choice: c_int) {
 unsafe {
-let endmsg_ptr = (&raw const endmsg) as *const *const c_char;
-let idx = if language != english {
+let idx = if get_language() != english {
 0usize
 } else {
 ((gametic as usize) % ((NUM_QUITMESSAGES as usize) - 2)) + 1
 };
-let raw_msg = CStr::from_ptr(*endmsg_ptr.add(idx)).to_str().unwrap_or("are you sure?");
+let raw_msg = crate::dstrings::get_quit_message(idx);
 let dosy_str = CStr::from_ptr(DOSY.as_ptr() as *const c_char)
 .to_str()
 .unwrap_or("(press y to quit)");
@@ -1175,7 +1175,7 @@ S_StartSound(ptr::null_mut(), sfx_stnmov as c_int);
 return 1;
 } else if k == KEY_F1 {
 M_StartControlPanel();
-currentMenu = if gamemode == retail {
+currentMenu = if get_gamemode() == retail {
 &raw mut ReadDef2
 } else {
 &raw mut ReadDef1
@@ -1434,7 +1434,7 @@ messageToPrint = 0;
 messageString = ptr::null_mut();
 messageLastMenuActive = menuactive;
 quickSaveSlot = -1;
-match gamemode {
+match get_gamemode() {
 commercial => {
 MainMenu[4] = MainMenu[5];
 MainDef.numitems -= 1;

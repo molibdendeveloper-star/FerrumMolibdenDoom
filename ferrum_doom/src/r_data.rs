@@ -10,12 +10,11 @@ use std::mem::size_of;
 use std::ptr;
 
 use crate::m_fixed::FRACBITS;
-use crate::r_sky::skytexture;
+use crate::r_sky::get_sky_texture;
 use crate::r_things::{numsprites, sprites};
 use crate::v_video::column_t;
 use crate::w_wad::{
-    W_CacheLumpName, W_CacheLumpNum, W_CheckNumForName, W_GetNumForName, W_LumpLength, W_ReadLump,
-    lumpinfo,
+    W_CacheLumpNum, W_LumpLength, W_ReadLump, lumpinfo, w_check_num_for_name, w_get_num_for_name,
 };
 use crate::z_zone::{PU_CACHE, PU_STATIC, Z_ChangeTag2, Z_Free, Z_Malloc};
 
@@ -76,7 +75,6 @@ fn doom_error(msg: &str) -> ! {
     unreachable!("I_Error should never return");
 }
 
-// --- Глобальные переменные r_data.c ---
 #[unsafe(no_mangle)]
 pub static mut firstflat: c_int = 0;
 
@@ -155,7 +153,14 @@ pub static mut texturememory: c_int = 0;
 #[unsafe(no_mangle)]
 pub static mut spritememory: c_int = 0;
 
-// --- R_DrawColumnInCache ---
+unsafe fn alloc_static_slice<T>(count: usize) -> (*mut T, &'static mut [T]) {
+    unsafe {
+        let bytes = (count * size_of::<T>()).max(8);
+        let raw = Z_Malloc(bytes as c_int, PU_STATIC, ptr::null_mut()) as *mut T;
+        (raw, std::slice::from_raw_parts_mut(raw, count))
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_DrawColumnInCache(
     mut patch: *mut column_t,
@@ -164,12 +169,14 @@ pub unsafe extern "C" fn R_DrawColumnInCache(
     cacheheight: c_int,
 ) {
     unsafe {
+        let dst_col = std::slice::from_raw_parts_mut(cache, cacheheight.max(0) as usize);
         while (*patch).topdelta != 0xff {
-            let source = (patch as *const u8).add(3);
             let mut count = (*patch).length as c_int;
             let mut position = originy + ((*patch).topdelta as c_int);
+            let mut src_skip = 0usize;
 
             if position < 0 {
+                src_skip = (-position) as usize;
                 count += position;
                 position = 0;
             }
@@ -179,7 +186,10 @@ pub unsafe extern "C" fn R_DrawColumnInCache(
             }
 
             if count > 0 {
-                ptr::copy_nonoverlapping(source, cache.add(position as usize), count as usize);
+                let len = count as usize;
+                let src = std::slice::from_raw_parts((patch as *const u8).add(3 + src_skip), len);
+                let pos = position as usize;
+                dst_col[pos..pos + len].copy_from_slice(src);
             }
 
             patch = (patch as *mut u8).add(((*patch).length as usize) + 4) as *mut column_t;
@@ -187,51 +197,41 @@ pub unsafe extern "C" fn R_DrawColumnInCache(
     }
 }
 
-// --- R_GenerateComposite ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_GenerateComposite(texnum: c_int) {
     unsafe {
         let tex_idx = texnum as usize;
-        let texture = *textures.add(tex_idx);
+        let texture = &**textures.add(tex_idx);
         let comp_size = *texturecompositesize.add(tex_idx);
         let user_slot = texturecomposite.add(tex_idx) as *mut c_void;
 
         let block = Z_Malloc(comp_size, PU_STATIC, user_slot) as *mut u8;
+        let tex_w = texture.width as c_int;
+        let tex_h = texture.height as c_int;
 
-        let collump = *texturecolumnlump.add(tex_idx);
-        let colofs = *texturecolumnofs.add(tex_idx);
+        let collump = std::slice::from_raw_parts(*texturecolumnlump.add(tex_idx), tex_w as usize);
+        let colofs = std::slice::from_raw_parts(*texturecolumnofs.add(tex_idx), tex_w as usize);
+        let patches =
+            std::slice::from_raw_parts(texture.patches.as_ptr(), texture.patchcount as usize);
 
-        let patches_ptr = (&raw const (*texture).patches) as *const texpatch_t;
-        let patchcount = (*texture).patchcount as usize;
-        let tex_w = (*texture).width as c_int;
-        let tex_h = (*texture).height as c_int;
-
-        for i in 0..patchcount {
-            let patch = &*patches_ptr.add(i);
+        for patch in patches {
             let realpatch = W_CacheLumpNum(patch.patch, PU_CACHE) as *mut patch_t;
+            let rp_ref = &*realpatch;
             let x1 = patch.originx;
-            let mut x2 = x1 + ((*realpatch).width as c_int);
+            let x2 = (x1 + (rp_ref.width as c_int)).min(tex_w);
+            let col_ofs_arr =
+                std::slice::from_raw_parts(rp_ref.columnofs.as_ptr(), rp_ref.width.max(0) as usize);
 
-            let mut x = if x1 < 0 { 0 } else { x1 };
-            if x2 > tex_w {
-                x2 = tex_w;
-            }
-
-            let col_ofs_arr = (&raw const (*realpatch).columnofs) as *const c_int;
-
-            while x < x2 {
+            for x in x1.max(0)..x2 {
                 let xu = x as usize;
-                if *collump.add(xu) >= 0 {
-                    x += 1;
+                if collump[xu] >= 0 {
                     continue;
                 }
-
-                let c_ofs = *col_ofs_arr.add((x - x1) as usize) as usize;
+                let c_ofs = col_ofs_arr[(x - x1) as usize] as usize;
                 let patchcol = (realpatch as *mut u8).add(c_ofs) as *mut column_t;
-                let dest_col = block.add(*colofs.add(xu) as usize);
+                let dest_col = block.add(colofs[xu] as usize);
 
                 R_DrawColumnInCache(patchcol, dest_col, patch.originy, tex_h);
-                x += 1;
             }
         }
 
@@ -239,52 +239,44 @@ pub unsafe extern "C" fn R_GenerateComposite(texnum: c_int) {
     }
 }
 
-// --- R_GenerateLookup ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_GenerateLookup(texnum: c_int) {
     unsafe {
         let tex_idx = texnum as usize;
-        let texture = *textures.add(tex_idx);
+        let texture = &**textures.add(tex_idx);
 
         *texturecomposite.add(tex_idx) = ptr::null_mut();
         *texturecompositesize.add(tex_idx) = 0;
 
-        let collump = *texturecolumnlump.add(tex_idx);
-        let colofs = *texturecolumnofs.add(tex_idx);
-
-        let tex_w = (*texture).width as usize;
-        let tex_h = (*texture).height as c_int;
+        let tex_w = texture.width as usize;
+        let tex_h = texture.height as c_int;
+        let collump = std::slice::from_raw_parts_mut(*texturecolumnlump.add(tex_idx), tex_w);
+        let colofs = std::slice::from_raw_parts_mut(*texturecolumnofs.add(tex_idx), tex_w);
         let mut patchcount = vec![0u8; tex_w];
 
-        let patches_ptr = (&raw const (*texture).patches) as *const texpatch_t;
-        let pcount = (*texture).patchcount as usize;
+        let patches =
+            std::slice::from_raw_parts(texture.patches.as_ptr(), texture.patchcount as usize);
 
-        for i in 0..pcount {
-            let patch = &*patches_ptr.add(i);
+        for patch in patches {
             let realpatch = W_CacheLumpNum(patch.patch, PU_CACHE) as *mut patch_t;
+            let rp_ref = &*realpatch;
             let x1 = patch.originx;
-            let mut x2 = x1 + ((*realpatch).width as c_int);
+            let x2 = (x1 + (rp_ref.width as c_int)).min(tex_w as c_int);
+            let col_ofs_arr =
+                std::slice::from_raw_parts(rp_ref.columnofs.as_ptr(), rp_ref.width.max(0) as usize);
 
-            let mut x = if x1 < 0 { 0 } else { x1 };
-            if x2 > (tex_w as c_int) {
-                x2 = tex_w as c_int;
-            }
-
-            let col_ofs_arr = (&raw const (*realpatch).columnofs) as *const c_int;
-
-            while x < x2 {
+            for x in x1.max(0)..x2 {
                 let xu = x as usize;
                 patchcount[xu] += 1;
-                *collump.add(xu) = patch.patch as c_short;
-                let c_ofs = *col_ofs_arr.add((x - x1) as usize);
-                *colofs.add(xu) = (c_ofs + 3) as c_ushort;
-                x += 1;
+                collump[xu] = patch.patch as c_short;
+                let c_ofs = col_ofs_arr[(x - x1) as usize];
+                colofs[xu] = (c_ofs + 3) as c_ushort;
             }
         }
 
         for x in 0..tex_w {
             if patchcount[x] == 0 {
-                let name_str = std::str::from_utf8(&(*texture).name)
+                let name_str = std::str::from_utf8(&texture.name)
                     .unwrap_or("????????")
                     .trim_end_matches('\0');
                 println!("R_GenerateLookup: column without a patch ({})", name_str);
@@ -292,9 +284,9 @@ pub unsafe extern "C" fn R_GenerateLookup(texnum: c_int) {
             }
 
             if patchcount[x] > 1 {
-                *collump.add(x) = -1;
+                collump[x] = -1;
                 let comp_size = *texturecompositesize.add(tex_idx);
-                *colofs.add(x) = comp_size as c_ushort;
+                colofs[x] = comp_size as c_ushort;
 
                 if comp_size > 0x10000 - tex_h {
                     doom_error(&format!("R_GenerateLookup: texture {} is >64k", texnum));
@@ -306,7 +298,6 @@ pub unsafe extern "C" fn R_GenerateLookup(texnum: c_int) {
     }
 }
 
-// --- R_GetColumn ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_GetColumn(tex: c_int, mut col: c_int) -> *mut u8 {
     unsafe {
@@ -331,61 +322,56 @@ pub unsafe extern "C" fn R_GetColumn(tex: c_int, mut col: c_int) -> *mut u8 {
     }
 }
 
-// --- R_InitTextures ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_InitTextures() {
-    unsafe {
-        let pnames_lump = b"PNAMES\0".as_ptr() as *const c_char;
-        let names = W_CacheLumpName(pnames_lump, PU_STATIC) as *mut u8;
-        let nummappatches = ptr::read_unaligned(names as *const i32);
-let name_p = names.add(4);
-let mut patchlookup = vec![-1 as c_int; nummappatches as usize];
-let mut name_buf = [0u8; 9];
-for i in 0..(nummappatches as usize) {
-ptr::copy_nonoverlapping(name_p.add(i * 8), name_buf.as_mut_ptr(), 8);
-*name_buf.as_mut_ptr().add(8) = 0;
-patchlookup[i] = W_CheckNumForName(name_buf.as_ptr() as *const c_char);
-}
-Z_Free(names as *mut c_void);
-let tex1_lump = b"TEXTURE1\0".as_ptr() as *const c_char;
-let maptex1 = W_CacheLumpName(tex1_lump, PU_STATIC) as *mut i32;
-let mut maptex = maptex1;
-let numtextures1 = ptr::read_unaligned(maptex);
-let mut maxoff = W_LumpLength(W_GetNumForName(tex1_lump));
-let mut directory = maptex.add(1);
-let tex2_lump = b"TEXTURE2\0".as_ptr() as *const c_char;
-let tex2_num = W_CheckNumForName(tex2_lump);
+let pnames_lump = w_get_num_for_name("PNAMES");
+let pnames_len = W_LumpLength(pnames_lump) as usize;
+let names_raw = W_CacheLumpNum(pnames_lump, PU_STATIC) as *mut u8;
+let patchlookup: Vec<c_int> = unsafe {
+let bytes = std::slice::from_raw_parts(names_raw, pnames_len);
+let nummappatches = i32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+(0..nummappatches)
+.map(|i| {
+let raw_name = &bytes[4 + i * 8..4 + (i + 1) * 8];
+let len = raw_name.iter().position(|&b| b == 0).unwrap_or(8);
+let s = std::str::from_utf8(&raw_name[..len]).unwrap_or("");
+w_check_num_for_name(s)
+})
+.collect()
+};
+Z_Free(names_raw as *mut c_void);
+let tex1_lump = w_get_num_for_name("TEXTURE1");
+let maptex1 = W_CacheLumpNum(tex1_lump, PU_STATIC) as *mut i32;
+let numtextures1 = unsafe { ptr::read_unaligned(maptex1) };
+let maxoff1 = W_LumpLength(tex1_lump);
+let tex2_num = w_check_num_for_name("TEXTURE2");
 let (maptex2, numtextures2, maxoff2) = if tex2_num != -1 {
-let m2 = W_CacheLumpName(tex2_lump, PU_STATIC) as *mut i32;
-let n2 = ptr::read_unaligned(m2);
+let m2 = W_CacheLumpNum(tex2_num, PU_STATIC) as *mut i32;
+let n2 = unsafe { ptr::read_unaligned(m2) };
 let off2 = W_LumpLength(tex2_num);
 (m2, n2, off2)
 } else {
 (ptr::null_mut(), 0, 0)
 };
+unsafe {
 numtextures = numtextures1 + numtextures2;
 let n_tex = numtextures as usize;
-textures = Z_Malloc((n_tex * size_of::<*mut texture_t>()) as c_int, PU_STATIC, ptr::null_mut())
-as *mut *mut texture_t;
-texturecolumnlump =
-Z_Malloc((n_tex * size_of::<*mut c_short>()) as c_int, PU_STATIC, ptr::null_mut())
-as *mut *mut c_short;
-texturecolumnofs =
-Z_Malloc((n_tex * size_of::<*mut c_ushort>()) as c_int, PU_STATIC, ptr::null_mut())
-as *mut *mut c_ushort;
-texturecomposite =
-Z_Malloc((n_tex * size_of::<*mut u8>()) as c_int, PU_STATIC, ptr::null_mut())
-as *mut *mut u8;
-texturecompositesize =
-Z_Malloc((n_tex * size_of::<c_int>()) as c_int, PU_STATIC, ptr::null_mut())
-as *mut c_int;
-texturewidthmask =
-Z_Malloc((n_tex * size_of::<c_int>()) as c_int, PU_STATIC, ptr::null_mut())
-as *mut c_int;
-textureheight =
-Z_Malloc((n_tex * size_of::<i32>()) as c_int, PU_STATIC, ptr::null_mut()) as *mut i32;
-let s_start = W_GetNumForName(b"S_START\0".as_ptr() as *const c_char);
-let s_end = W_GetNumForName(b"S_END\0".as_ptr() as *const c_char) - 1;
+let (tex_ptr, tex_slice) = alloc_static_slice::<*mut texture_t>(n_tex);
+textures = tex_ptr;
+let (clump_ptr, clump_slice) = alloc_static_slice::<*mut c_short>(n_tex);
+texturecolumnlump = clump_ptr;
+let (cofs_ptr, cofs_slice) = alloc_static_slice::<*mut c_ushort>(n_tex);
+texturecolumnofs = cofs_ptr;
+let (comp_ptr, _) = alloc_static_slice::<*mut u8>(n_tex);
+texturecomposite = comp_ptr;
+let (csize_ptr, _) = alloc_static_slice::<c_int>(n_tex);
+texturecompositesize = csize_ptr;
+let (wmask_ptr, wmask_slice) = alloc_static_slice::<c_int>(n_tex);
+texturewidthmask = wmask_ptr;
+let (theight_ptr, theight_slice) = alloc_static_slice::<i32>(n_tex);
+textureheight = theight_ptr;
+let s_start = w_get_num_for_name("S_START");
+let s_end = w_get_num_for_name("S_END") - 1;
 let temp3 = ((s_end - s_start + 63) / 64) + ((numtextures + 63) / 64);
 print!("[");
 for _ in 0..temp3 {
@@ -397,6 +383,9 @@ print!("\x08");
 }
 print!("\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08");
 let _ = io::stdout().flush();
+let mut maptex = maptex1;
+let mut maxoff = maxoff1;
+let mut directory = maptex.add(1);
 for i in 0..numtextures {
 if (i & 63) == 0 {
 print!(".");
@@ -420,39 +409,39 @@ let tex_bytes =
 size_of::<texture_t>() + size_of::<texpatch_t>() * ((patchcount as usize) - 1);
 let texture = Z_Malloc(tex_bytes as c_int, PU_STATIC, ptr::null_mut()) as *mut texture_t;
 let idx = i as usize;
-*textures.add(idx) = texture;
+tex_slice[idx] = texture;
 (*texture).width = width;
 (*texture).height = height;
 (*texture).patchcount = patchcount;
 (*texture).name = ptr::read_unaligned(&raw const (*mtexture).name);
 let mpatch_base = (&raw const (*mtexture).patches) as *const mappatch_t;
-let patch_base = (&raw mut (*texture).patches) as *mut texpatch_t;
-for j in 0..(patchcount as usize) {
+let patch_dst =
+std::slice::from_raw_parts_mut((*texture).patches.as_mut_ptr(), patchcount as usize);
+for (j, p) in patch_dst.iter_mut().enumerate() {
 let mp = mpatch_base.add(j);
-let p = patch_base.add(j);
 let ox = ptr::read_unaligned(&raw const (*mp).originx);
 let oy = ptr::read_unaligned(&raw const (*mp).originy);
 let p_idx = ptr::read_unaligned(&raw const (*mp).patch) as usize;
-(*p).originx = ox as c_int;
-(*p).originy = oy as c_int;
-(*p).patch = patchlookup[p_idx];
-if (*p).patch == -1 {
+p.originx = ox as c_int;
+p.originy = oy as c_int;
+p.patch = patchlookup[p_idx];
+if p.patch == -1 {
 let tname = std::str::from_utf8(&(*texture).name)
 .unwrap_or("????????")
 .trim_end_matches('\0');
 doom_error(&format!("R_InitTextures: Missing patch in texture {}", tname));
 }
 }
-*texturecolumnlump.add(idx) =
+clump_slice[idx] =
 Z_Malloc((width as c_int) * 2, PU_STATIC, ptr::null_mut()) as *mut c_short;
-*texturecolumnofs.add(idx) =
+cofs_slice[idx] =
 Z_Malloc((width as c_int) * 2, PU_STATIC, ptr::null_mut()) as *mut c_ushort;
 let mut j = 1;
 while j * 2 <= width {
 j <<= 1;
 }
-*texturewidthmask.add(idx) = (j - 1) as c_int;
-*textureheight.add(idx) = (height as i32) << FRACBITS;
+wmask_slice[idx] = (j - 1) as c_int;
+theight_slice[idx] = (height as i32) << FRACBITS;
 }
 Z_Free(maptex1 as *mut c_void);
 if !maptex2.is_null() {
@@ -461,62 +450,62 @@ Z_Free(maptex2 as *mut c_void);
 for i in 0..numtextures {
 R_GenerateLookup(i);
 }
-texturetranslation =
-Z_Malloc(((numtextures + 1) * 4) as c_int, PU_STATIC, ptr::null_mut()) as *mut c_int;
-for i in 0..numtextures {
-*texturetranslation.add(i as usize) = i;
+let (ttrans_ptr, ttrans_slice) = alloc_static_slice::<c_int>((numtextures + 1) as usize);
+texturetranslation = ttrans_ptr;
+for (i, slot) in ttrans_slice[..n_tex].iter_mut().enumerate() {
+*slot = i as c_int;
 }
 }
 }
-// --- R_InitFlats ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_InitFlats() {
 unsafe {
-firstflat = W_GetNumForName(b"F_START\0".as_ptr() as *const c_char) + 1;
-lastflat = W_GetNumForName(b"F_END\0".as_ptr() as *const c_char) - 1;
+firstflat = w_get_num_for_name("F_START") + 1;
+lastflat = w_get_num_for_name("F_END") - 1;
 numflats = lastflat - firstflat + 1;
-flattranslation =
-Z_Malloc(((numflats + 1) * 4) as c_int, PU_STATIC, ptr::null_mut()) as *mut c_int;
-for i in 0..numflats {
-*flattranslation.add(i as usize) = i;
+let n_flats = numflats as usize;
+let (ftrans_ptr, ftrans_slice) = alloc_static_slice::<c_int>(n_flats + 1);
+flattranslation = ftrans_ptr;
+for (i, slot) in ftrans_slice[..n_flats].iter_mut().enumerate() {
+*slot = i as c_int;
 }
 }
 }
-// --- R_InitSpriteLumps ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_InitSpriteLumps() {
 unsafe {
-firstspritelump = W_GetNumForName(b"S_START\0".as_ptr() as *const c_char) + 1;
-lastspritelump = W_GetNumForName(b"S_END\0".as_ptr() as *const c_char) - 1;
+firstspritelump = w_get_num_for_name("S_START") + 1;
+lastspritelump = w_get_num_for_name("S_END") - 1;
 numspritelumps = lastspritelump - firstspritelump + 1;
-spritewidth = Z_Malloc(numspritelumps * 4, PU_STATIC, ptr::null_mut()) as *mut i32;
-spriteoffset = Z_Malloc(numspritelumps * 4, PU_STATIC, ptr::null_mut()) as *mut i32;
-spritetopoffset = Z_Malloc(numspritelumps * 4, PU_STATIC, ptr::null_mut()) as *mut i32;
-for i in 0..numspritelumps {
+let n_spr = numspritelumps as usize;
+let (sw_ptr, sw_slice) = alloc_static_slice::<i32>(n_spr);
+let (so_ptr, so_slice) = alloc_static_slice::<i32>(n_spr);
+let (sto_ptr, sto_slice) = alloc_static_slice::<i32>(n_spr);
+spritewidth = sw_ptr;
+spriteoffset = so_ptr;
+spritetopoffset = sto_ptr;
+for i in 0..n_spr {
 if (i & 63) == 0 {
 print!(".");
 let _ = io::stdout().flush();
 }
-let patch = W_CacheLumpNum(firstspritelump + i, PU_CACHE) as *mut patch_t;
-let idx = i as usize;
-*spritewidth.add(idx) = ((*patch).width as i32) << FRACBITS;
-*spriteoffset.add(idx) = ((*patch).leftoffset as i32) << FRACBITS;
-*spritetopoffset.add(idx) = ((*patch).topoffset as i32) << FRACBITS;
+let patch = &*(W_CacheLumpNum(firstspritelump + (i as c_int), PU_CACHE) as *const patch_t);
+sw_slice[i] = (patch.width as i32) << FRACBITS;
+so_slice[i] = (patch.leftoffset as i32) << FRACBITS;
+sto_slice[i] = (patch.topoffset as i32) << FRACBITS;
 }
 }
 }
-// --- R_InitColormaps ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_InitColormaps() {
-unsafe {
-let lump = W_GetNumForName(b"COLORMAP\0".as_ptr() as *const c_char);
+let lump = w_get_num_for_name("COLORMAP");
 let length = W_LumpLength(lump) + 255;
 let raw_ptr = Z_Malloc(length, PU_STATIC, ptr::null_mut()) as usize;
+unsafe {
 colormaps = ((raw_ptr + 255) & !255) as *mut u8;
 W_ReadLump(lump, colormaps as *mut c_void);
 }
 }
-// --- R_InitData ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_InitData() {
 unsafe {
@@ -531,23 +520,20 @@ print!("\nInitColormaps");
 let _ = io::stdout().flush();
 }
 }
-// --- R_FlatNumForName ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_FlatNumForName(name: *mut c_char) -> c_int {
-unsafe {
-let i = W_CheckNumForName(name);
+if name.is_null() {
+doom_error("R_FlatNumForName: NULL");
+}
+let bytes = unsafe { std::slice::from_raw_parts(name as *const u8, 8) };
+let len = bytes.iter().position(|&b| b == 0).unwrap_or(8);
+let s = std::str::from_utf8(&bytes[..len]).unwrap_or("????????");
+let i = w_check_num_for_name(s);
 if i == -1 {
-let mut namet = [0u8; 9];
-ptr::copy_nonoverlapping(name as *const u8, namet.as_mut_ptr(), 8);
-let s = CStr::from_ptr(namet.as_ptr() as *const c_char)
-.to_str()
-.unwrap_or("????????");
 doom_error(&format!("R_FlatNumForName: {} not found", s));
 }
-i - firstflat
+i - unsafe { firstflat }
 }
-}
-// --- R_CheckTextureNumForName ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_CheckTextureNumForName(name: *mut c_char) -> c_int {
 if name.is_null() {
@@ -560,101 +546,99 @@ return 0;
 let target = std::slice::from_raw_parts(name as *const u8, 8);
 let target_len = target.iter().position(|&b| b == 0).unwrap_or(8);
 let target_slice = &target[..target_len];
-for i in 0..numtextures {
-let tex = *textures.add(i as usize);
-let tex_name = &(*tex).name;
+let tex_slice = std::slice::from_raw_parts(textures, numtextures as usize);
+for (i, &tex_ptr) in tex_slice.iter().enumerate() {
+let tex_name = &(*tex_ptr).name;
 let tex_len = tex_name.iter().position(|&b| b == 0).unwrap_or(8);
 if tex_len == target_len && tex_name[..tex_len].eq_ignore_ascii_case(target_slice) {
-return i;
+return i as c_int;
 }
 }
 }
 -1
 }
-// --- R_TextureNumForName ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_TextureNumForName(name: *mut c_char) -> c_int {
-unsafe {
-let i = R_CheckTextureNumForName(name);
+let i = unsafe { R_CheckTextureNumForName(name) };
 if i == -1 {
 let s = if name.is_null() {
 "NULL"
 } else {
-CStr::from_ptr(name).to_str().unwrap_or("????????")
+unsafe { CStr::from_ptr(name).to_str().unwrap_or("????????") }
 };
 doom_error(&format!("R_TextureNumForName: {} not found", s));
 }
 i
 }
-}
-// --- R_PrecacheLevel ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_PrecacheLevel() {
 unsafe {
 if demoplayback != 0 {
 return;
 }
-let mut flatpresent = vec![0u8; numflats as usize];
-for i in 0..(numsectors as usize) {
-let sec = sectors.add(i);
-flatpresent[(*sec).floorpic as usize] = 1;
-flatpresent[(*sec).ceilingpic as usize] = 1;
+let lumps = std::slice::from_raw_parts(lumpinfo, crate::w_wad::numlumps as usize);
+let mut flatpresent = vec![false; numflats as usize];
+let secs = std::slice::from_raw_parts(sectors, numsectors as usize);
+for sec in secs {
+flatpresent[sec.floorpic as usize] = true;
+flatpresent[sec.ceilingpic as usize] = true;
 }
 flatmemory = 0;
-for i in 0..(numflats as usize) {
-if flatpresent[i] != 0 {
+for (i, &present) in flatpresent.iter().enumerate() {
+if present {
 let lump = firstflat + (i as c_int);
-flatmemory += (*lumpinfo.add(lump as usize)).size;
+flatmemory += lumps[lump as usize].size;
 W_CacheLumpNum(lump, PU_CACHE);
 }
 }
-let mut texturepresent = vec![0u8; numtextures as usize];
-for i in 0..(numsides as usize) {
-let side = sides.add(i);
-texturepresent[(*side).toptexture as usize] = 1;
-texturepresent[(*side).midtexture as usize] = 1;
-texturepresent[(*side).bottomtexture as usize] = 1;
+let mut texturepresent = vec![false; numtextures as usize];
+let sds = std::slice::from_raw_parts(sides, numsides as usize);
+for side in sds {
+texturepresent[side.toptexture as usize] = true;
+texturepresent[side.midtexture as usize] = true;
+texturepresent[side.bottomtexture as usize] = true;
 }
-texturepresent[skytexture as usize] = 1;
+texturepresent[get_sky_texture() as usize] = true;
 texturememory = 0;
-for i in 0..(numtextures as usize) {
-if texturepresent[i] == 0 {
+let tex_slice = std::slice::from_raw_parts(textures, numtextures as usize);
+for (i, &present) in texturepresent.iter().enumerate() {
+if !present {
 continue;
 }
-let texture = *textures.add(i);
-let patches_ptr = (&raw const (*texture).patches) as *const texpatch_t;
-let pcount = (*texture).patchcount as usize;
-for j in 0..pcount {
-let lump = (*patches_ptr.add(j)).patch;
-texturememory += (*lumpinfo.add(lump as usize)).size;
-W_CacheLumpNum(lump, PU_CACHE);
+let texture = &*tex_slice[i];
+let patches =
+std::slice::from_raw_parts(texture.patches.as_ptr(), texture.patchcount as usize);
+for p in patches {
+texturememory += lumps[p.patch as usize].size;
+W_CacheLumpNum(p.patch, PU_CACHE);
 }
 }
-let mut spritepresent = vec![0u8; numsprites as usize];
+let mut spritepresent = vec![false; numsprites as usize];
 let cap_ptr = &raw mut thinkercap;
 let mut th = (*cap_ptr).next;
 let mobj_thinker_ptr = P_MobjThinker as *const ();
 while th != cap_ptr {
 if let Some(func) = (*th).function.acp1 {
 if (func as *const ()) == mobj_thinker_ptr {
-let mobj = th as *const mobj_t;
-spritepresent[(*mobj).sprite as usize] = 1;
+let mobj = (th as *const mobj_t).as_ref().unwrap();
+spritepresent[mobj.sprite as usize] = true;
 }
 }
 th = (*th).next;
 }
 spritememory = 0;
-for i in 0..(numsprites as usize) {
-if spritepresent[i] == 0 {
+let spr_slice = std::slice::from_raw_parts(sprites, numsprites as usize);
+for (i, &present) in spritepresent.iter().enumerate() {
+if !present {
 continue;
 }
-let spr = sprites.add(i);
-for j in 0..((*spr).numframes as usize) {
-let sf = (*spr).spriteframes.add(j);
-let lump_ptr = (&raw const (*sf).lump) as *const i16;
-for k in 0..8 {
-let lump = firstspritelump + (*lump_ptr.add(k) as c_int);
-spritememory += (*lumpinfo.add(lump as usize)).size;
+let spr = &spr_slice[i];
+let frames =
+std::slice::from_raw_parts(spr.spriteframes, spr.numframes as usize);
+for sf in frames {
+for &lump_idx in &sf.lump {
+let lump = firstspritelump + (lump_idx as c_int);
+spritememory += lumps[lump as usize].size;
 W_CacheLumpNum(lump, PU_CACHE);
 }
 }

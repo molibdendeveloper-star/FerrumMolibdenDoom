@@ -1,12 +1,11 @@
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, static_mut_refs)]
 
 pub use crate::bindings::*;
-use crate::r_segs::line_s;
-use crate::r_things::{player_s, player_t};
+use crate::r_things::player_t;
 
 use std::ffi::{c_int, c_void};
-use std::mem::transmute;
 use std::ptr;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::z_zone::Z_Free;
 
@@ -26,19 +25,36 @@ unsafe extern "C" {
     static mut players: [player_t; NUM_PLAYERS];
 }
 
-// --- Глобальные переменные p_tick.c ---
-#[unsafe(no_mangle)]
-pub static mut leveltime: c_int = 0;
-
-#[unsafe(no_mangle)]
-pub static mut thinkercap: thinker_t = unsafe { std::mem::zeroed() };
+static LEVEL_TIME: AtomicI32 = AtomicI32::new(0);
 
 #[inline]
-fn removed_thinker_fn() -> Option<unsafe extern "C" fn()> {
-    unsafe { transmute::<isize, Option<unsafe extern "C" fn()>>(-1) }
+pub fn get_leveltime() -> c_int {
+    LEVEL_TIME.load(Ordering::Relaxed)
 }
 
-// --- P_InitThinkers ---
+#[inline]
+pub fn set_leveltime(val: c_int) {
+    LEVEL_TIME.store(val, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_leveltime() {
+    LEVEL_TIME.fetch_add(1, Ordering::Relaxed);
+}
+
+#[unsafe(no_mangle)]
+pub static mut thinkercap: thinker_t = thinker_t {
+    prev: ptr::null_mut(),
+    next: ptr::null_mut(),
+    function: actionf_t { acv: None },
+};
+
+/// Проверяет, помечен ли thinker на удаление (без UB-трансмутации -1 в указатель на функцию).
+#[inline]
+pub fn is_thinker_removed(thinker: &thinker_t) -> bool {
+    unsafe { thinker.function.acv.is_none() && thinker.prev.is_null() }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn P_InitThinkers() {
     unsafe {
@@ -48,7 +64,6 @@ pub unsafe extern "C" fn P_InitThinkers() {
     }
 }
 
-// --- P_AddThinker ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn P_AddThinker(thinker: *mut thinker_t) {
     unsafe {
@@ -61,35 +76,34 @@ pub unsafe extern "C" fn P_AddThinker(thinker: *mut thinker_t) {
     }
 }
 
-// --- P_RemoveThinker ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn P_RemoveThinker(thinker: *mut thinker_t) {
     unsafe {
-        (*thinker).function.acv = removed_thinker_fn();
+        let next = (*thinker).next;
+        let prev = (*thinker).prev;
+        if !prev.is_null() && !next.is_null() {
+            (*next).prev = prev;
+            (*prev).next = next;
+        }
+        // Помечаем узел как удалённый: function = None, prev = null
+        (*thinker).function.acv = None;
+        (*thinker).prev = ptr::null_mut();
     }
 }
 
-// --- P_AllocateThinker ---
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn P_AllocateThinker(_thinker: *mut thinker_t) {
-    // NOP в оригинальном DOOM
-}
+pub unsafe extern "C" fn P_AllocateThinker(_thinker: *mut thinker_t) {}
 
-// --- P_RunThinkers ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn P_RunThinkers() {
     unsafe {
         let cap = &raw mut thinkercap;
         let mut current = (*cap).next;
-        let tombstone = removed_thinker_fn();
 
         while current != cap {
             let next = (*current).next;
 
-            if (*current).function.acv == tombstone {
-                let prev = (*current).prev;
-                (*next).prev = prev;
-                (*prev).next = next;
+            if is_thinker_removed(&*current) {
                 Z_Free(current as *mut c_void);
             } else if let Some(func) = (*current).function.acp1 {
                 func(current as *mut c_void);
@@ -100,7 +114,6 @@ pub unsafe extern "C" fn P_RunThinkers() {
     }
 }
 
-// --- P_Ticker ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn P_Ticker() {
     unsafe {
@@ -128,6 +141,6 @@ pub unsafe extern "C" fn P_Ticker() {
         P_UpdateSpecials();
         P_RespawnSpecials();
 
-        leveltime += 1;
+        inc_leveltime();
     }
 }

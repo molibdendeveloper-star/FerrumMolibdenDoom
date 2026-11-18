@@ -1,6 +1,7 @@
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, static_mut_refs)]
 
 pub use crate::bindings::*;
+use crate::doomstat::{get_gamemode};
 use crate::r_segs::line_s;
 use crate::r_things::{player_s, player_t};
 
@@ -69,7 +70,6 @@ unsafe extern "C" {
     fn EV_DoDoor(line: *mut line_t, door_type: vldoor_e) -> c_int;
 
     static mut gameskill: skill_t;
-    static mut gamemode: GameMode_t;
     static mut gameepisode: c_int;
     static mut gamemap: c_int;
     static mut fastparm: c_int;
@@ -1261,7 +1261,7 @@ P_RadiusAttack(thingy as *mut _, (*thingy).target as *mut _, 128);
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn A_BossDeath(mo: *mut mobj_t) {
 unsafe {
-if gamemode == commercial {
+if get_gamemode() == commercial {
 if gamemap != 7 {
 return;
 }
@@ -1334,7 +1334,7 @@ return;
 th = (*th).next;
 }
 let mut junk: line_t = std::mem::zeroed();
-if gamemode == commercial {
+if get_gamemode() == commercial {
 if gamemap == 7 {
 if (*mo).type_ == MT_FATSO {
 junk.tag = 666;
@@ -1566,7 +1566,7 @@ P_RemoveMobj(mo as *mut _);
 pub unsafe extern "C" fn A_PlayerScream(mo: *mut mobj_t) {
 unsafe {
 let mut sound = sfx_pldeth as c_int;
-if gamemode == commercial && (*mo).health < -50 {
+if get_gamemode() == commercial && (*mo).health < -50 {
 sound = sfx_pdiehi as c_int;
 }
 S_StartSound(mo as *mut c_void, sound);

@@ -2,7 +2,6 @@
 
 pub use crate::bindings::*;
 use crate::r_segs::line_s;
-use crate::r_things::player_s;
 
 use std::ffi::{c_int, c_void};
 use std::mem::size_of;
@@ -14,7 +13,7 @@ use crate::p_spec::{
     P_FindHighestFloorSurrounding, P_FindLowestCeilingSurrounding, P_FindLowestFloorSurrounding,
     P_FindNextHighestFloor, P_FindSectorFromLineTag, getSector, getSide, twoSided,
 };
-use crate::p_tick::{P_AddThinker, P_RemoveThinker, leveltime};
+use crate::p_tick::{P_AddThinker, P_RemoveThinker, get_leveltime};
 use crate::r_data::textureheight;
 use crate::z_zone::{PU_LEVSPEC, Z_Malloc};
 
@@ -22,7 +21,151 @@ unsafe extern "C" {
     fn S_StartSound(origin: *mut c_void, sound_id: c_int);
 }
 
-// --- T_MovePlane ---
+#[inline]
+fn change_sector(sector: &mut sector_t, crush: c_int) -> bool {
+    let map_sec = (sector as *mut sector_t) as *mut crate::p_map::sector_t;
+    unsafe { P_ChangeSector(map_sec, crush) != 0 }
+}
+
+/// Безопасная логика перемещения плоскости пола или потолка сектора.
+pub fn t_move_plane(
+    sector: &mut sector_t,
+    speed: i32,
+    dest: i32,
+    crush: c_int,
+    floor_or_ceiling: c_int,
+    direction: c_int,
+) -> result_e {
+    match floor_or_ceiling {
+        0 => match direction {
+            -1 => {
+                if sector.floorheight.wrapping_sub(speed) < dest {
+                    let lastpos = sector.floorheight;
+                    sector.floorheight = dest;
+                    if change_sector(sector, crush) {
+                        sector.floorheight = lastpos;
+                        change_sector(sector, crush);
+                    }
+                    return pastdest;
+                } else {
+                    let lastpos = sector.floorheight;
+                    sector.floorheight = sector.floorheight.wrapping_sub(speed);
+                    if change_sector(sector, crush) {
+                        sector.floorheight = lastpos;
+                        change_sector(sector, crush);
+                        return crushed;
+                    }
+                }
+            }
+            1 => {
+                if sector.floorheight.wrapping_add(speed) > dest {
+                    let lastpos = sector.floorheight;
+                    sector.floorheight = dest;
+                    if change_sector(sector, crush) {
+                        sector.floorheight = lastpos;
+                        change_sector(sector, crush);
+                    }
+                    return pastdest;
+                } else {
+                    let lastpos = sector.floorheight;
+                    sector.floorheight = sector.floorheight.wrapping_add(speed);
+                    if change_sector(sector, crush) {
+                        if crush != 0 {
+                            return crushed;
+                        }
+                        sector.floorheight = lastpos;
+                        change_sector(sector, crush);
+                        return crushed;
+                    }
+                }
+            }
+            _ => {}
+        },
+        1 => match direction {
+            -1 => {
+                if sector.ceilingheight.wrapping_sub(speed) < dest {
+                    let lastpos = sector.ceilingheight;
+                    sector.ceilingheight = dest;
+                    if change_sector(sector, crush) {
+                        sector.ceilingheight = lastpos;
+                        change_sector(sector, crush);
+                    }
+                    return pastdest;
+                } else {
+                    let lastpos = sector.ceilingheight;
+                    sector.ceilingheight = sector.ceilingheight.wrapping_sub(speed);
+                    if change_sector(sector, crush) {
+                        if crush != 0 {
+                            return crushed;
+                        }
+                        sector.ceilingheight = lastpos;
+                        change_sector(sector, crush);
+                        return crushed;
+                    }
+                }
+            }
+            1 => {
+                if sector.ceilingheight.wrapping_add(speed) > dest {
+                    let lastpos = sector.ceilingheight;
+                    sector.ceilingheight = dest;
+                    if change_sector(sector, crush) {
+                        sector.ceilingheight = lastpos;
+                        change_sector(sector, crush);
+                    }
+                    return pastdest;
+                } else {
+                    sector.ceilingheight = sector.ceilingheight.wrapping_add(speed);
+                    change_sector(sector, crush);
+                }
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+
+    ok
+}
+
+/// Безопасный тикер движения пола.
+pub fn t_move_floor(floor: &mut floormove_t) {
+    let Some(sec) = (unsafe { floor.sector.as_mut() }) else {
+        return;
+    };
+
+    let res = t_move_plane(
+        sec,
+        floor.speed,
+        floor.floordestheight,
+        floor.crush,
+        0,
+        floor.direction,
+    );
+
+    let sound_org = (&raw mut sec.soundorg) as *mut c_void;
+    if (get_leveltime() & 7) == 0 {
+        unsafe {
+            S_StartSound(sound_org, sfx_stnmov as c_int);
+        }
+    }
+
+    if res == pastdest {
+        sec.specialdata = ptr::null_mut();
+
+        if floor.direction == 1 && floor.type_ == donutRaise {
+            sec.special = floor.newspecial as i16;
+            sec.floorpic = floor.texture;
+        } else if floor.direction == -1 && floor.type_ == lowerAndChange {
+            sec.special = floor.newspecial as i16;
+            sec.floorpic = floor.texture;
+        }
+
+        unsafe {
+            P_RemoveThinker((&raw mut floor.thinker) as *mut crate::p_tick::thinker_t);
+            S_StartSound(sound_org, sfx_pstop as c_int);
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn T_MovePlane(
     sector: *mut sector_t,
@@ -32,153 +175,19 @@ pub unsafe extern "C" fn T_MovePlane(
     floor_or_ceiling: c_int,
     direction: c_int,
 ) -> result_e {
-    unsafe {
-        let map_sec = sector as *mut crate::p_map::sector_t;
-
-        match floor_or_ceiling {
-            0 => {
-                // FLOOR
-                match direction {
-                    -1 => {
-                        // DOWN
-                        if (*sector).floorheight.wrapping_sub(speed) < dest {
-                            let lastpos = (*sector).floorheight;
-                            (*sector).floorheight = dest;
-                            if P_ChangeSector(map_sec, crush) != 0 {
-                                (*sector).floorheight = lastpos;
-                                P_ChangeSector(map_sec, crush);
-                            }
-                            return pastdest;
-                        } else {
-                            let lastpos = (*sector).floorheight;
-                            (*sector).floorheight = (*sector).floorheight.wrapping_sub(speed);
-                            if P_ChangeSector(map_sec, crush) != 0 {
-                                (*sector).floorheight = lastpos;
-                                P_ChangeSector(map_sec, crush);
-                                return crushed;
-                            }
-                        }
-                    }
-                    1 => {
-                        // UP
-                        if (*sector).floorheight.wrapping_add(speed) > dest {
-                            let lastpos = (*sector).floorheight;
-                            (*sector).floorheight = dest;
-                            if P_ChangeSector(map_sec, crush) != 0 {
-                                (*sector).floorheight = lastpos;
-                                P_ChangeSector(map_sec, crush);
-                            }
-                            return pastdest;
-                        } else {
-                            let lastpos = (*sector).floorheight;
-                            (*sector).floorheight = (*sector).floorheight.wrapping_add(speed);
-                            if P_ChangeSector(map_sec, crush) != 0 {
-                                if crush != 0 {
-                                    return crushed;
-                                }
-                                (*sector).floorheight = lastpos;
-                                P_ChangeSector(map_sec, crush);
-                                return crushed;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            1 => {
-                // CEILING
-                match direction {
-                    -1 => {
-                        // DOWN
-                        if (*sector).ceilingheight.wrapping_sub(speed) < dest {
-                            let lastpos = (*sector).ceilingheight;
-                            (*sector).ceilingheight = dest;
-                            if P_ChangeSector(map_sec, crush) != 0 {
-                                (*sector).ceilingheight = lastpos;
-                                P_ChangeSector(map_sec, crush);
-                            }
-                            return pastdest;
-                        } else {
-                            let lastpos = (*sector).ceilingheight;
-                            (*sector).ceilingheight = (*sector).ceilingheight.wrapping_sub(speed);
-                            if P_ChangeSector(map_sec, crush) != 0 {
-                                if crush != 0 {
-                                    return crushed;
-                                }
-                                (*sector).ceilingheight = lastpos;
-                                P_ChangeSector(map_sec, crush);
-                                return crushed;
-                            }
-                        }
-                    }
-                    1 => {
-                        // UP
-                        if (*sector).ceilingheight.wrapping_add(speed) > dest {
-                            let lastpos = (*sector).ceilingheight;
-                            (*sector).ceilingheight = dest;
-                            if P_ChangeSector(map_sec, crush) != 0 {
-                                (*sector).ceilingheight = lastpos;
-                                P_ChangeSector(map_sec, crush);
-                            }
-                            return pastdest;
-                        } else {
-                            (*sector).ceilingheight = (*sector).ceilingheight.wrapping_add(speed);
-                            P_ChangeSector(map_sec, crush);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            _ => {}
-        }
-
-        ok
+    match unsafe { sector.as_mut() } {
+        Some(sec) => t_move_plane(sec, speed, dest, crush, floor_or_ceiling, direction),
+        None => ok,
     }
 }
 
-// --- T_MoveFloor ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn T_MoveFloor(floor: *mut floormove_t) {
-    unsafe {
-        let sec = (*floor).sector;
-        let res = T_MovePlane(
-            sec,
-            (*floor).speed,
-            (*floor).floordestheight,
-            (*floor).crush,
-            0,
-            (*floor).direction,
-        );
-
-        let sound_org = (&raw mut (*sec).soundorg) as *mut c_void;
-        if (leveltime & 7) == 0 {
-            S_StartSound(sound_org, sfx_stnmov as c_int);
-        }
-
-        if res == pastdest {
-            (*sec).specialdata = ptr::null_mut();
-
-            if (*floor).direction == 1 {
-                if (*floor).type_ == donutRaise {
-                    (*sec).special = (*floor).newspecial as i16;
-                    (*sec).floorpic = (*floor).texture;
-                }
-            } else if (*floor).direction == -1 {
-                if (*floor).type_ == lowerAndChange {
-                    (*sec).special = (*floor).newspecial as i16;
-                    (*sec).floorpic = (*floor).texture;
-                }
-            }
-
-            P_RemoveThinker((&raw mut (*floor).thinker) as *mut crate::p_tick::thinker_t);
-            S_StartSound(sound_org, sfx_pstop as c_int);
-        }
+    if let Some(fl) = unsafe { floor.as_mut() } {
+        t_move_floor(fl);
     }
 }
 
-// --- EV_DoFloor ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn EV_DoFloor(line: *mut line_t, floortype: floor_e) -> c_int {
     unsafe {
@@ -254,19 +263,19 @@ pub unsafe extern "C" fn EV_DoFloor(line: *mut line_t, floortype: floor_e) -> c_
                     (*floor).floordestheight = dest;
                 }
                 raiseFloorTurbo => {
-(*floor).direction = 1;
-(*floor).sector = sec;
-(*floor).speed = flr_spd * 4;
-(*floor).floordestheight = P_FindNextHighestFloor(spec_sec, (*sec).floorheight);
-}
-raiseFloorToNearest => {
-(*floor).direction = 1;
-(*floor).sector = sec;
-(*floor).speed = flr_spd;
-(*floor).floordestheight = P_FindNextHighestFloor(spec_sec, (*sec).floorheight);
-}
-raiseFloor24 => {
-(*floor).direction = 1;
+                    (*floor).direction = 1;
+                    (*floor).sector = sec;
+                    (*floor).speed = flr_spd * 4;
+                    (*floor).floordestheight = P_FindNextHighestFloor(spec_sec, (*sec).floorheight);
+                }
+                raiseFloorToNearest => {
+                    (*floor).direction = 1;
+                    (*floor).sector = sec;
+                    (*floor).speed = flr_spd;
+                    (*floor).floordestheight = P_FindNextHighestFloor(spec_sec, (*sec).floorheight);
+                }
+                raiseFloor24 => {
+                    (*floor).direction = 1;
 (*floor).sector = sec;
 (*floor).speed = flr_spd;
 (*floor).floordestheight = (*sec).floorheight + 24 * frac_u;
@@ -341,7 +350,6 @@ _ => {}
 rtn
 }
 }
-// --- EV_BuildStairs ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn EV_BuildStairs(line: *mut line_t, stair_type: stair_e) -> c_int {
 unsafe {
@@ -380,9 +388,8 @@ let mut height = (*sec).floorheight + stairsize;
 let texture = (*sec).floorpic;
 loop {
 let mut found_next = false;
-let lines_ptr = (*sec).lines;
-for i in 0..((*sec).linecount as usize) {
-let ln = *lines_ptr.add(i);
+let sec_lines = std::slice::from_raw_parts((*sec).lines, (*sec).linecount as usize);
+for &ln in sec_lines {
 if ((*ln).flags as u32 & ML_TWOSIDED) == 0 {
 continue;
 }

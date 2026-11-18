@@ -1,19 +1,48 @@
-#![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, static_mut_refs)]
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-pub use crate::bindings::*;
-use crate::r_segs::line_s;
-use crate::r_things::player_s;
+use crate::bindings::{GameMission_t, GameMode_t, Language_t, doom, english, indetermined};
 
-use std::ffi::c_int;
+static GAMEMODE: AtomicU32 = AtomicU32::new(indetermined);
+static GAMEMISSION: AtomicU32 = AtomicU32::new(doom);
+static LANGUAGE: AtomicU32 = AtomicU32::new(english);
+static MODIFIED_GAME: AtomicBool = AtomicBool::new(false);
 
-#[unsafe(no_mangle)]
-pub static mut gamemode: GameMode_t = indetermined;
+#[inline]
+pub fn get_gamemode() -> GameMode_t {
+    GAMEMODE.load(Ordering::Relaxed)
+}
 
-#[unsafe(no_mangle)]
-pub static mut gamemission: GameMission_t = doom;
+#[inline]
+pub fn set_gamemode(mode: GameMode_t) {
+    GAMEMODE.store(mode, Ordering::Relaxed);
+}
 
-#[unsafe(no_mangle)]
-pub static mut language: Language_t = english;
+#[inline]
+pub fn get_gamemission() -> GameMission_t {
+    GAMEMISSION.load(Ordering::Relaxed)
+}
 
-#[unsafe(no_mangle)]
-pub static mut modifiedgame: c_int = 0;
+#[inline]
+pub fn set_gamemission(mission: GameMission_t) {
+    GAMEMISSION.store(mission, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn get_language() -> Language_t {
+    LANGUAGE.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn set_language(lang: Language_t) {
+    LANGUAGE.store(lang, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn is_modified_game() -> bool {
+    MODIFIED_GAME.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn set_modified_game(val: bool) {
+    MODIFIED_GAME.store(val, Ordering::Relaxed);
+}

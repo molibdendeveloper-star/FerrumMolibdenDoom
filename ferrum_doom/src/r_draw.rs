@@ -1,11 +1,13 @@
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, static_mut_refs)]
 
 pub use crate::bindings::*;
+use crate::doomstat::get_gamemode;
 use crate::r_segs::line_s;
 use crate::r_things::player_s;
 
-use std::ffi::{CString, c_char, c_int, c_uint, c_void};
+use std::ffi::{CString, c_char, c_int, c_uint};
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::m_fixed::FRACBITS;
 use crate::v_video::{V_DrawPatch, V_MarkRect, screens};
@@ -19,6 +21,8 @@ pub const SBARHEIGHT: c_int = 32;
 const SCR_W: c_int = SCREENWIDTH as c_int;
 const SCR_H: c_int = SCREENHEIGHT as c_int;
 const SCR_W_USIZE: usize = SCREENWIDTH as usize;
+const SCR_H_USIZE: usize = SCREENHEIGHT as usize;
+const SCR_PIXELS: usize = SCR_W_USIZE * SCR_H_USIZE;
 
 const FUZZTABLE: usize = 50;
 const FUZZOFF: isize = SCR_W as isize;
@@ -33,13 +37,12 @@ static FUZZOFFSET: [isize; FUZZTABLE] = [
     FUZZOFF, FUZZOFF, -FUZZOFF, FUZZOFF, FUZZOFF, -FUZZOFF, FUZZOFF,
 ];
 
-static mut FUZZPOS: usize = 0;
+static FUZZPOS: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" {
     fn I_Error(error: *const c_char, ...);
     static mut centery: c_int;
     static mut colormaps: *mut u8;
-    static mut gamemode: GameMode_t;
 }
 
 fn doom_error(msg: &str) -> ! {
@@ -50,7 +53,6 @@ fn doom_error(msg: &str) -> ! {
     unreachable!("I_Error should never return");
 }
 
-// --- Глобальные переменные r_draw.c ---
 #[unsafe(no_mangle)]
 pub static mut viewimage: *mut u8 = ptr::null_mut();
 
@@ -138,11 +140,18 @@ pub static mut ds_source: *mut u8 = ptr::null_mut();
 #[unsafe(no_mangle)]
 pub static mut dscount: c_int = 0;
 
-// --- R_DrawColumn ---
+#[inline]
+unsafe fn screen_slice(idx: usize) -> &'static mut [u8] {
+    unsafe {
+        let scr_ptr = (&raw const screens) as *const *mut u8;
+        std::slice::from_raw_parts_mut(*scr_ptr.add(idx), SCR_PIXELS)
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_DrawColumn() {
     unsafe {
-        let mut count = dc_yh - dc_yl;
+        let count = dc_yh - dc_yl;
         if count < 0 {
             return;
         }
@@ -151,37 +160,29 @@ pub unsafe extern "C" fn R_DrawColumn() {
             doom_error(&format!("R_DrawColumn: {} to {} at {}", dc_yl, dc_yh, dc_x));
         }
 
-        let ylook_ptr = (&raw const ylookup) as *const *mut u8;
-        let col_ptr = (&raw const columnofs) as *const c_int;
-        let mut dest = (*ylook_ptr.add(dc_yl as usize)).offset(*col_ptr.add(dc_x as usize) as isize);
+        let col_ofs = (&raw const columnofs).as_ref().unwrap();
+        let start_y = (viewwindowy + dc_yl) as usize;
+        let x_pos = col_ofs[dc_x as usize] as usize;
+
+        let scr = screen_slice(0);
+        let cmap = std::slice::from_raw_parts(dc_colormap, 256);
+        let src = std::slice::from_raw_parts(dc_source, 128);
 
         let fracstep = dc_iscale;
         let mut frac = dc_texturemid.wrapping_add((dc_yl - centery).wrapping_mul(fracstep));
 
-        let cmap = dc_colormap;
-        let src = dc_source;
-
-        loop {
+        for row in 0..=(count as usize) {
             let tex_idx = ((frac >> FRACBITS) & 127) as usize;
-            let color_idx = *src.add(tex_idx) as usize;
-            *dest = *cmap.add(color_idx);
-
-            dest = dest.add(SCR_W_USIZE);
+            scr[(start_y + row) * SCR_W_USIZE + x_pos] = cmap[src[tex_idx] as usize];
             frac = frac.wrapping_add(fracstep);
-
-            if count == 0 {
-                break;
-            }
-            count -= 1;
         }
     }
 }
 
-// --- R_DrawColumnLow ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_DrawColumnLow() {
     unsafe {
-        let mut count = dc_yh - dc_yl;
+        let count = dc_yh - dc_yl;
         if count < 0 {
             return;
         }
@@ -191,39 +192,29 @@ pub unsafe extern "C" fn R_DrawColumnLow() {
         }
 
         dc_x <<= 1;
+        let col_ofs = (&raw const columnofs).as_ref().unwrap();
+        let start_y = (viewwindowy + dc_yl) as usize;
+        let x1 = col_ofs[dc_x as usize] as usize;
+        let x2 = col_ofs[(dc_x + 1) as usize] as usize;
 
-        let ylook_ptr = (&raw const ylookup) as *const *mut u8;
-        let col_ptr = (&raw const columnofs) as *const c_int;
-        let base_row = *ylook_ptr.add(dc_yl as usize);
-        let mut dest = base_row.offset(*col_ptr.add(dc_x as usize) as isize);
-        let mut dest2 = base_row.offset(*col_ptr.add((dc_x + 1) as usize) as isize);
+        let scr = screen_slice(0);
+        let cmap = std::slice::from_raw_parts(dc_colormap, 256);
+        let src = std::slice::from_raw_parts(dc_source, 128);
 
         let fracstep = dc_iscale;
         let mut frac = dc_texturemid.wrapping_add((dc_yl - centery).wrapping_mul(fracstep));
 
-        let cmap = dc_colormap;
-        let src = dc_source;
-
-        loop {
+        for row in 0..=(count as usize) {
             let tex_idx = ((frac >> FRACBITS) & 127) as usize;
-            let color_idx = *src.add(tex_idx) as usize;
-            let pixel = *cmap.add(color_idx);
-            *dest = pixel;
-            *dest2 = pixel;
-
-            dest = dest.add(SCR_W_USIZE);
-            dest2 = dest2.add(SCR_W_USIZE);
+            let pixel = cmap[src[tex_idx] as usize];
+            let base = (start_y + row) * SCR_W_USIZE;
+            scr[base + x1] = pixel;
+            scr[base + x2] = pixel;
             frac = frac.wrapping_add(fracstep);
-
-            if count == 0 {
-                break;
-            }
-            count -= 1;
         }
     }
 }
 
-// --- R_DrawFuzzColumn (невидимость спектров) ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_DrawFuzzColumn() {
     unsafe {
@@ -234,7 +225,7 @@ pub unsafe extern "C" fn R_DrawFuzzColumn() {
             dc_yh = viewheight - 2;
         }
 
-        let mut count = dc_yh - dc_yl;
+        let count = dc_yh - dc_yl;
         if count < 0 {
             return;
         }
@@ -243,37 +234,33 @@ pub unsafe extern "C" fn R_DrawFuzzColumn() {
             doom_error(&format!("R_DrawFuzzColumn: {} to {} at {}", dc_yl, dc_yh, dc_x));
         }
 
-        let ylook_ptr = (&raw const ylookup) as *const *mut u8;
-        let col_ptr = (&raw const columnofs) as *const c_int;
-        let mut dest = (*ylook_ptr.add(dc_yl as usize)).offset(*col_ptr.add(dc_x as usize) as isize);
+        let col_ofs = (&raw const columnofs).as_ref().unwrap();
+        let start_y = (viewwindowy + dc_yl) as usize;
+        let x_pos = col_ofs[dc_x as usize] as usize;
 
-        let cmap_6 = colormaps.add(6 * 256);
+        let scr = screen_slice(0);
+        let cmap_6 = std::slice::from_raw_parts(colormaps.add(6 * 256), 256);
+        let mut fpos = FUZZPOS.load(Ordering::Relaxed);
 
-        loop {
-            let offset = FUZZOFFSET[FUZZPOS];
-            let neighbor = *dest.offset(offset) as usize;
-            *dest = *cmap_6.add(neighbor);
+        for row in 0..=(count as usize) {
+            let cur_idx = (start_y + row) * SCR_W_USIZE + x_pos;
+            let src_idx = (cur_idx as isize + FUZZOFFSET[fpos]).clamp(0, (SCR_PIXELS - 1) as isize) as usize;
+            let neighbor = scr[src_idx] as usize;
+            scr[cur_idx] = cmap_6[neighbor];
 
-            FUZZPOS += 1;
-            if FUZZPOS == FUZZTABLE {
-                FUZZPOS = 0;
+            fpos += 1;
+            if fpos == FUZZTABLE {
+                fpos = 0;
             }
-
-            dest = dest.add(SCR_W_USIZE);
-
-            if count == 0 {
-                break;
-            }
-            count -= 1;
         }
+        FUZZPOS.store(fpos, Ordering::Relaxed);
     }
 }
 
-// --- R_DrawTranslatedColumn ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_DrawTranslatedColumn() {
     unsafe {
-        let mut count = dc_yh - dc_yl;
+        let count = dc_yh - dc_yl;
         if count < 0 {
             return;
         }
@@ -282,35 +269,27 @@ pub unsafe extern "C" fn R_DrawTranslatedColumn() {
             doom_error(&format!("R_DrawColumn: {} to {} at {}", dc_yl, dc_yh, dc_x));
         }
 
-        let ylook_ptr = (&raw const ylookup) as *const *mut u8;
-        let col_ptr = (&raw const columnofs) as *const c_int;
-        let mut dest = (*ylook_ptr.add(dc_yl as usize)).offset(*col_ptr.add(dc_x as usize) as isize);
+        let col_ofs = (&raw const columnofs).as_ref().unwrap();
+        let start_y = (viewwindowy + dc_yl) as usize;
+        let x_pos = col_ofs[dc_x as usize] as usize;
+
+        let scr = screen_slice(0);
+        let cmap = std::slice::from_raw_parts(dc_colormap, 256);
+        let trans = std::slice::from_raw_parts(dc_translation, 256);
+        let src = std::slice::from_raw_parts(dc_source, 256);
 
         let fracstep = dc_iscale;
         let mut frac = dc_texturemid.wrapping_add((dc_yl - centery).wrapping_mul(fracstep));
 
-        let cmap = dc_colormap;
-        let trans = dc_translation;
-        let src = dc_source;
-
-        loop {
-            let tex_idx = (frac >> FRACBITS) as isize;
-            let raw_color = *src.offset(tex_idx) as usize;
-            let mapped_color = *trans.add(raw_color) as usize;
-            *dest = *cmap.add(mapped_color);
-
-            dest = dest.add(SCR_W_USIZE);
+        for row in 0..=(count as usize) {
+            let tex_idx = ((frac >> FRACBITS) & 255) as usize;
+            let mapped_color = trans[src[tex_idx] as usize] as usize;
+            scr[(start_y + row) * SCR_W_USIZE + x_pos] = cmap[mapped_color];
             frac = frac.wrapping_add(fracstep);
-
-            if count == 0 {
-                break;
-            }
-            count -= 1;
         }
     }
 }
 
-// --- R_InitTranslationTables ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_InitTranslationTables() {
     unsafe {
@@ -318,23 +297,23 @@ pub unsafe extern "C" fn R_InitTranslationTables() {
         let aligned = (raw_ptr + 255) & !255;
         translationtables = aligned as *mut u8;
 
+        let tables = std::slice::from_raw_parts_mut(translationtables, 256 * 3);
         for i in 0..256usize {
             if (0x70..=0x7f).contains(&i) {
                 let low = (i & 0xf) as u8;
-                *translationtables.add(i) = 0x60 + low;
-                *translationtables.add(i + 256) = 0x40 + low;
-                *translationtables.add(i + 512) = 0x20 + low;
+                tables[i] = 0x60 + low;
+                tables[i + 256] = 0x40 + low;
+                tables[i + 512] = 0x20 + low;
             } else {
                 let b = i as u8;
-                *translationtables.add(i) = b;
-                *translationtables.add(i + 256) = b;
-                *translationtables.add(i + 512) = b;
+                tables[i] = b;
+                tables[i + 256] = b;
+                tables[i + 512] = b;
             }
         }
     }
 }
 
-// --- R_DrawSpan ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_DrawSpan() {
     unsafe {
@@ -344,30 +323,24 @@ pub unsafe extern "C" fn R_DrawSpan() {
 
         let mut xfrac = ds_xfrac;
         let mut yfrac = ds_yfrac;
-
-        let ylook_ptr = (&raw const ylookup) as *const *mut u8;
-let col_ptr = (&raw const columnofs) as *const c_int;
-let mut dest = (*ylook_ptr.add(ds_y as usize)).offset(*col_ptr.add(ds_x1 as usize) as isize);
-let mut count = ds_x2 - ds_x1;
-let cmap = ds_colormap;
-let src = ds_source;
+let col_ofs = (&raw const columnofs).as_ref().unwrap();
+let row_y = (viewwindowy + ds_y) as usize;
+let start_x = col_ofs[ds_x1 as usize] as usize;
+let count = (ds_x2 - ds_x1) as usize;
+let scr = screen_slice(0);
+let cmap = std::slice::from_raw_parts(ds_colormap, 256);
+let src = std::slice::from_raw_parts(ds_source, 64 * 64);
 let xstep = ds_xstep;
 let ystep = ds_ystep;
-loop {
+let dst_row = &mut scr[row_y * SCR_W_USIZE + start_x..=row_y * SCR_W_USIZE + start_x + count];
+for px in dst_row {
 let spot = (((yfrac >> (16 - 6)) & (63 * 64)) + ((xfrac >> 16) & 63)) as usize;
-let color_idx = *src.add(spot) as usize;
-*dest = *cmap.add(color_idx);
-dest = dest.add(1);
+*px = cmap[src[spot] as usize];
 xfrac = xfrac.wrapping_add(xstep);
 yfrac = yfrac.wrapping_add(ystep);
-if count == 0 {
-break;
-}
-count -= 1;
 }
 }
 }
-// --- R_DrawSpanLow ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_DrawSpanLow() {
 unsafe {
@@ -378,78 +351,70 @@ let mut xfrac = ds_xfrac;
 let mut yfrac = ds_yfrac;
 ds_x1 <<= 1;
 ds_x2 <<= 1;
-let ylook_ptr = (&raw const ylookup) as *const *mut u8;
-let col_ptr = (&raw const columnofs) as *const c_int;
-let mut dest = (*ylook_ptr.add(ds_y as usize)).offset(*col_ptr.add(ds_x1 as usize) as isize);
-let mut count = ds_x2 - ds_x1;
-let cmap = ds_colormap;
-let src = ds_source;
+let col_ofs = (&raw const columnofs).as_ref().unwrap();
+let row_y = (viewwindowy + ds_y) as usize;
+let start_x = col_ofs[ds_x1 as usize] as usize;
+let count = (ds_x2 - ds_x1) as usize;
+let scr = screen_slice(0);
+let cmap = std::slice::from_raw_parts(ds_colormap, 256);
+let src = std::slice::from_raw_parts(ds_source, 64 * 64);
 let xstep = ds_xstep;
 let ystep = ds_ystep;
-loop {
+let base = row_y * SCR_W_USIZE + start_x;
+let mut i = 0usize;
+while i <= count {
 let spot = (((yfrac >> (16 - 6)) & (63 * 64)) + ((xfrac >> 16) & 63)) as usize;
-let color_idx = *src.add(spot) as usize;
-let pixel = *cmap.add(color_idx);
-*dest = pixel;
-dest = dest.add(1);
-*dest = pixel;
-dest = dest.add(1);
+let pixel = cmap[src[spot] as usize];
+scr[base + i] = pixel;
+if i + 1 <= count {
+scr[base + i + 1] = pixel;
+}
+i += 2;
 xfrac = xfrac.wrapping_add(xstep);
 yfrac = yfrac.wrapping_add(ystep);
-if count == 0 {
-break;
-}
-count -= 1;
 }
 }
 }
-// --- R_InitBuffer ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_InitBuffer(width: c_int, height: c_int) {
 unsafe {
 viewwindowx = (SCR_W - width) >> 1;
-let col_ptr = (&raw mut columnofs) as *mut c_int;
-for i in 0..width {
-*col_ptr.add(i as usize) = viewwindowx + i;
+let col_arr = (&raw mut columnofs).as_mut().unwrap();
+for i in 0..(width as usize) {
+col_arr[i] = viewwindowx + (i as c_int);
 }
-if width == SCR_W {
-viewwindowy = 0;
+viewwindowy = if width == SCR_W {
+0
 } else {
-viewwindowy = (SCR_H - SBARHEIGHT - height) >> 1;
-}
+(SCR_H - SBARHEIGHT - height) >> 1
+};
 let scr0 = *(&raw const screens as *const *mut u8);
-let ylook_ptr = (&raw mut ylookup) as *mut *mut u8;
-for i in 0..height {
-*ylook_ptr.add(i as usize) = scr0.offset(((i + viewwindowy) * SCR_W) as isize);
+let ylook_arr = (&raw mut ylookup).as_mut().unwrap();
+for i in 0..(height as usize) {
+ylook_arr[i] = scr0.add(((i as c_int + viewwindowy) * SCR_W) as usize);
 }
 }
 }
-// --- R_FillBackScreen ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_FillBackScreen() {
 unsafe {
 if scaledviewwidth == 320 {
 return;
 }
-let name: &[u8] = if gamemode == commercial {
+let name: &[u8] = if get_gamemode() == commercial {
 b"GRNROCK\0"
 } else {
 b"FLOOR7_2\0"
 };
-let src = W_CacheLumpName(name.as_ptr() as *const c_char, PU_CACHE) as *const u8;
-let scr_ptr = &raw const screens as *const *mut u8;
-let mut dest = *scr_ptr.add(1);
-let max_y = SCR_H - SBARHEIGHT;
+let src_ptr = W_CacheLumpName(name.as_ptr() as *const c_char, PU_CACHE) as *const u8;
+let src = std::slice::from_raw_parts(src_ptr, 64 * 64);
+let dst = screen_slice(1);
+let max_y = (SCR_H - SBARHEIGHT) as usize;
 for y in 0..max_y {
-let row_src = src.add(((y & 63) << 6) as usize);
-for _ in 0..(SCR_W / 64) {
-ptr::copy_nonoverlapping(row_src, dest, 64);
-dest = dest.add(64);
-}
-let rem = (SCR_W & 63) as usize;
-if rem != 0 {
-ptr::copy_nonoverlapping(row_src, dest, rem);
-dest = dest.add(rem);
+let row_src = &src[((y & 63) << 6)..((y & 63) << 6) + 64];
+let dst_row = &mut dst[y * SCR_W_USIZE..(y + 1) * SCR_W_USIZE];
+for chunk in dst_row.chunks_mut(64) {
+chunk.copy_from_slice(&row_src[..chunk.len()]);
 }
 }
 let draw_border = |lump: &[u8], x: c_int, y: c_int| {
@@ -474,20 +439,17 @@ draw_border(b"brdr_bl\0", viewwindowx - 8, viewwindowy + viewheight);
 draw_border(b"brdr_br\0", viewwindowx + scaledviewwidth, viewwindowy + viewheight);
 }
 }
-// --- R_VideoErase ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_VideoErase(ofs: c_uint, count: c_int) {
-unsafe {
 if count <= 0 {
 return;
 }
-let scr_ptr = &raw const screens as *const *mut u8;
-let scr0 = (*scr_ptr).add(ofs as usize);
-let scr1 = (*scr_ptr.add(1)).add(ofs as usize);
-ptr::copy_nonoverlapping(scr1, scr0, count as usize);
+let start = ofs as usize;
+let len = count as usize;
+let scr0 = unsafe { screen_slice(0) };
+let scr1 = unsafe { screen_slice(1) };
+scr0[start..start + len].copy_from_slice(&scr1[start..start + len]);
 }
-}
-// --- R_DrawViewBorder ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn R_DrawViewBorder() {
 unsafe {

@@ -1,9 +1,6 @@
-#![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, static_mut_refs)]
+#![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code)]
 
 pub use crate::bindings::*;
-use crate::r_segs::line_s;
-use crate::r_things::player_s;
-
 use std::ffi::{c_char, c_int};
 
 const fn scramble(a: u8) -> u8 {
@@ -17,74 +14,111 @@ const fn scramble(a: u8) -> u8 {
         .wrapping_add((a & 128) >> 7)
 }
 
-static mut FIRST_TIME: bool = true;
-static mut CHEAT_XLATE_TABLE: [u8; 256] = [0; 256];
+const CHEAT_XLATE_TABLE: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = scramble(i as u8);
+        i += 1;
+    }
+    table
+};
 
-// --- cht_CheckCheat ---
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn cht_CheckCheat(cht: *mut cheatseq_t, key: c_char) -> c_int {
-    unsafe {
-        let mut rc = 0;
+/// Безопасная реализация проверки чит-кода поверх среза байтов.
+pub fn check_cheat_bytes(seq: &mut [u8], pos: &mut usize, key: u8) -> bool {
+    if *pos >= seq.len() {
+        *pos = 0;
+    }
 
-        if FIRST_TIME {
-            FIRST_TIME = false;
-            let table_ptr = (&raw mut CHEAT_XLATE_TABLE) as *mut u8;
-            for i in 0..256usize {
-                *table_ptr.add(i) = scramble(i as u8);
-            }
+    if seq[*pos] == 0 {
+        seq[*pos] = key;
+        *pos += 1;
+    } else if CHEAT_XLATE_TABLE[key as usize] == seq[*pos] {
+        *pos += 1;
+    } else {
+        *pos = 0;
+    }
+
+    if *pos < seq.len() {
+        if seq[*pos] == 1 {
+            *pos += 1;
+        } else if seq[*pos] == 0xff {
+            *pos = 0;
+            return true;
         }
+    }
 
-        if (*cht).p.is_null() {
-            (*cht).p = (*cht).sequence;
+    false
+}
+
+/// Безопасное извлечение параметра чит-кода (например, номера уровня для IDCLEV).
+pub fn get_cheat_param_bytes(seq: &mut [u8], out: &mut [u8]) {
+    let Some(marker_idx) = seq.iter().position(|&b| b == 1) else {
+        return;
+    };
+
+    let mut p_idx = marker_idx + 1;
+    let mut out_idx = 0;
+
+    while p_idx < seq.len() && out_idx < out.len() {
+        let c = seq[p_idx];
+        out[out_idx] = c;
+        out_idx += 1;
+        seq[p_idx] = 0;
+        p_idx += 1;
+
+        if c == 0 || (p_idx < seq.len() && seq[p_idx] == 0xff) {
+            break;
         }
+    }
 
-        if *(*cht).p == 0 {
-            *(*cht).p = key as u8;
-            (*cht).p = (*cht).p.add(1);
-        } else {
-            let table_ptr = (&raw const CHEAT_XLATE_TABLE) as *const u8;
-            if *table_ptr.add((key as u8) as usize) == *(*cht).p {
-                (*cht).p = (*cht).p.add(1);
-            } else {
-                (*cht).p = (*cht).sequence;
-            }
-        }
-
-        if *(*cht).p == 1 {
-            (*cht).p = (*cht).p.add(1);
-        } else if *(*cht).p == 0xff {
-            (*cht).p = (*cht).sequence;
-            rc = 1;
-        }
-
-        rc
+    if p_idx < seq.len() && seq[p_idx] == 0xff && out_idx < out.len() {
+        out[out_idx] = 0;
     }
 }
 
-// --- cht_GetParam ---
+// --- Тонкий совместимый слой для st_stuff / am_map ---
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn cht_GetParam(cht: *mut cheatseq_t, mut buffer: *mut c_char) {
+pub unsafe extern "C" fn cht_CheckCheat(cht: *mut cheatseq_t, key: c_char) -> c_int {
     unsafe {
-        let mut p = (*cht).sequence;
-        while *p != 1 {
-            p = p.add(1);
+        if cht.is_null() || (*cht).sequence.is_null() {
+            return 0;
         }
-        p = p.add(1);
-
-        loop {
-            let c = *p;
-            *buffer = c as c_char;
-            buffer = buffer.add(1);
-            *p = 0;
-            p = p.add(1);
-
-            if c == 0 || *p == 0xff {
-                break;
-            }
+        let seq_ptr = (*cht).sequence;
+        let mut len = 0usize;
+        while *seq_ptr.add(len) != 0xff {
+            len += 1;
         }
+        len += 1; // включаем завершающий маркер 0xff
 
-        if *p == 0xff {
-            *buffer = 0;
+        let seq_slice = std::slice::from_raw_parts_mut(seq_ptr, len);
+        let mut pos = if (*cht).p.is_null() {
+            0
+        } else {
+            (*cht).p.offset_from(seq_ptr).max(0) as usize
+        };
+
+        let matched = check_cheat_bytes(seq_slice, &mut pos, key as u8);
+        (*cht).p = seq_ptr.add(pos);
+        matched as c_int
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cht_GetParam(cht: *mut cheatseq_t, buffer: *mut c_char) {
+    unsafe {
+        if cht.is_null() || (*cht).sequence.is_null() || buffer.is_null() {
+            return;
         }
+        let seq_ptr = (*cht).sequence;
+        let mut len = 0usize;
+        while *seq_ptr.add(len) != 0xff {
+            len += 1;
+        }
+        len += 1;
+
+        let seq_slice = std::slice::from_raw_parts_mut(seq_ptr, len);
+        let out_slice = std::slice::from_raw_parts_mut(buffer as *mut u8, 16);
+        get_cheat_param_bytes(seq_slice, out_slice);
     }
 }

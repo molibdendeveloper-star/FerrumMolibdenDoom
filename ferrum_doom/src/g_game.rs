@@ -1,6 +1,7 @@
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, static_mut_refs)]
 
 pub use crate::bindings::*;
+use crate::doomstat::get_gamemode;
 use crate::r_segs::line_s;
 use crate::r_things::{player_s, player_t};
 
@@ -8,37 +9,41 @@ use std::ffi::{CStr, c_char, c_int, c_short, c_void};
 use std::mem::size_of;
 use std::ptr;
 
+use crate::am_map::{AM_Responder, AM_Stop, AM_Ticker, automapactive};
+use crate::d_main::{D_AdvanceDemo, D_PageTicker};
+use crate::d_net::{maketic, netcmds, ticdup};
 use crate::f_finale::{F_Responder, F_StartFinale, F_Ticker};
 use crate::hu_stuff::{HU_Responder, HU_Ticker, HU_dequeueChatChar, player_names};
+use crate::i_system::{I_BaseTiccmd, I_GetTime, I_Quit};
 use crate::info::{mobjinfo, states};
-use crate::m_argv::{m_check_parm, myargc, myargv};
+use crate::m_argv::{args_len, get_arg, m_check_parm};
 use crate::m_fixed::FRACBITS;
-const FRAC_UNIT: c_int = 65536;
 use crate::m_menu::M_StartControlPanel;
 use crate::m_misc::{M_ReadFile, M_WriteFile};
-use crate::m_random::{m_clear_random, p_random, rndindex};
+use crate::m_random::{get_rnd_index, m_clear_random, p_random};
+use crate::p_inter::maxammo;
 use crate::p_map::P_CheckPosition;
-use crate::p_mobj::{P_RemoveMobj, P_SpawnMobj};
+use crate::p_mobj::{P_RemoveMobj, P_SpawnMobj, P_SpawnPlayer};
 use crate::p_saveg::{
     P_ArchivePlayers, P_ArchiveSpecials, P_ArchiveThinkers, P_ArchiveWorld, P_UnArchivePlayers,
     P_UnArchiveSpecials, P_UnArchiveThinkers, P_UnArchiveWorld, save_p,
 };
 use crate::p_setup::{P_SetupLevel, deathmatch_p, deathmatchstarts, playerstarts};
-
-use crate::p_tick::{P_Ticker, leveltime};
+use crate::p_tick::{P_Ticker, get_leveltime, set_leveltime};
 use crate::r_data::{R_FlatNumForName, R_TextureNumForName};
 use crate::r_draw::R_FillBackScreen;
 use crate::r_main::{R_ExecuteSetViewSize, R_PointInSubsector, setsizeneeded};
-use crate::r_sky::{skyflatnum, skytexture};
-const SKYFLATNAME: &[u8] = b"F_SKY1\0";
+use crate::r_sky::{set_sky_flat_num, set_sky_texture};
 use crate::s_sound::{S_PauseSound, S_ResumeSound, S_StartSound};
 use crate::st_stuff::{ST_Responder, ST_Ticker};
 use crate::tables::{ANGLETOFINESHIFT, FINEANGLES, finesine};
 use crate::v_video::{doom_error, screens};
-use crate::w_wad::{W_CacheLumpName, W_CheckNumForName};
+use crate::w_wad::{W_CacheLumpName, w_check_num_for_name};
 use crate::wi_stuff::{WI_Start, WI_Ticker};
 use crate::z_zone::{PU_CACHE, PU_STATIC, Z_ChangeTag2 as Z_ChangeTag, Z_CheckHeap, Z_Free, Z_Malloc};
 
+const FRAC_UNIT: c_int = 65536;
+const SKYFLATNAME: &[u8] = b"F_SKY1\0";
 const SAVEGAMESIZE: usize = 0x2c000;
 const VERSION: u32 = 109;
 const SAVESTRINGSIZE: usize = 24;
@@ -52,37 +57,92 @@ const BACKUP_TICS: usize = 12;
 const TURBOTHRESHOLD: i8 = 0x32;
 const SLOWTURNTICS: c_int = 6;
 const NUMKEYS: usize = 256;
+const QUARTER_FINE: usize = FINEANGLES / 4;
 
 const GGSAVED_STR: &[u8] = b"game saved.\0";
 const SAVEGAMENAME_STR: &str = "doomsav";
 
+const EMPTY_PSP: pspdef_t = pspdef_t {
+    state: ptr::null_mut(),
+    tics: 0,
+    sx: 0,
+    sy: 0,
+};
+
+const EMPTY_PLAYER: player_t = player_t {
+    mo: ptr::null_mut(),
+    playerstate: 0,
+    cmd: [0; 8],
+    viewz: 0,
+    viewheight: 0,
+    deltaviewheight: 0,
+    bob: 0,
+    health: 0,
+    armorpoints: 0,
+    armortype: 0,
+    powers: [0; 6],
+    cards: [0; 6],
+    backpack: 0,
+    frags: [0; 4],
+    readyweapon: 0,
+    pendingweapon: 0,
+    weaponowned: [0; 9],
+    ammo: [0; 4],
+    maxammo: [0; 4],
+    attackdown: 0,
+    usedown: 0,
+    cheats: 0,
+    refire: 0,
+    killcount: 0,
+    itemcount: 0,
+    secretcount: 0,
+    message: ptr::null_mut(),
+    damagecount: 0,
+    bonuscount: 0,
+    attacker: ptr::null_mut(),
+    extralight: 0,
+    fixedcolormap: 0,
+    colormap: 0,
+    psprites: [EMPTY_PSP; NUMPSPRITES as usize],
+    didsecret: 0,
+};
+
+const EMPTY_WBPLAYER: wbplayerstruct_t = wbplayerstruct_t {
+    in_: 0,
+    skills: 0,
+    sitems: 0,
+    ssecret: 0,
+    stime: 0,
+    frags: [0; 4],
+    score: 0,
+};
+
+const EMPTY_WBSTART: wbstartstruct_t = wbstartstruct_t {
+    epsd: 0,
+    didsecret: 0,
+    last: 0,
+    next: 0,
+    maxkills: 0,
+    maxitems: 0,
+    maxsecret: 0,
+    maxfrags: 0,
+    partime: 0,
+    pnum: 0,
+    plyr: [EMPTY_WBPLAYER; NUM_PLAYERS],
+};
+
 unsafe extern "C" {
-    fn I_BaseTiccmd() -> *mut ticcmd_t;
-    fn I_GetTime() -> c_int;
-    fn I_Quit();
-    fn D_AdvanceDemo();
-    fn D_PageTicker();
-    fn AM_Responder(ev: *mut event_t) -> c_int;
-    fn AM_Ticker();
-    fn AM_Stop();
+    
     fn M_ScreenShot();
-    fn P_SpawnPlayer(mthing: *mut mapthing_t);
 
     static mut wipegamestate: gamestate_t;
-    static mut ticdup: c_int;
-    static mut maketic: c_int;
-    static mut netcmds: [[ticcmd_t; BACKUP_TICS]; NUM_PLAYERS];
     static mut respawnparm: c_int;
     static mut fastparm: c_int;
     static mut nomonsters: c_int;
     static mut singletics: c_int;
-    static mut gamemode: GameMode_t;
-    static mut automapactive: c_int;
     static mut mouseSensitivity: c_int;
-    static mut maxammo: [c_int; NUM_AMMO];
 }
 
-// --- Глобальные переменные g_game.c ---
 #[unsafe(no_mangle)]
 pub static mut gameaction: gameaction_t = ga_nothing;
 
@@ -138,7 +198,7 @@ pub static mut netgame: c_int = 0;
 pub static mut playeringame: [c_int; NUM_PLAYERS] = [0; NUM_PLAYERS];
 
 #[unsafe(no_mangle)]
-pub static mut players: [player_t; NUM_PLAYERS] = unsafe { std::mem::zeroed() };
+pub static mut players: [player_t; NUM_PLAYERS] = [EMPTY_PLAYER; NUM_PLAYERS];
 
 #[unsafe(no_mangle)]
 pub static mut consoleplayer: c_int = 0;
@@ -189,7 +249,7 @@ pub static mut singledemo: c_int = 0;
 pub static mut precache: c_int = 1;
 
 #[unsafe(no_mangle)]
-pub static mut wminfo: wbstartstruct_t = unsafe { std::mem::zeroed() };
+pub static mut wminfo: wbstartstruct_t = EMPTY_WBSTART;
 
 #[unsafe(no_mangle)]
 pub static mut consistancy: [[c_short; BACKUP_TICS]; NUM_PLAYERS] = [[0; BACKUP_TICS]; NUM_PLAYERS];
@@ -197,7 +257,6 @@ pub static mut consistancy: [[c_short; BACKUP_TICS]; NUM_PLAYERS] = [[0; BACKUP_
 #[unsafe(no_mangle)]
 pub static mut savebuffer: *mut u8 = ptr::null_mut();
 
-// --- Клавиши и мышь ---
 #[unsafe(no_mangle)]
 pub static mut key_right: c_int = 0;
 #[unsafe(no_mangle)]
@@ -301,64 +360,48 @@ pub static mut bodyqueslot: c_int = 0;
 #[unsafe(no_mangle)]
 pub static mut statcopy: *mut c_void = ptr::null_mut();
 
-// --- G_CmdChecksum ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn G_CmdChecksum(cmd: *mut ticcmd_t) -> c_int {
-    unsafe {
-        let mut sum: c_int = 0;
-        let ptr = cmd as *const c_int;
-        let count = (size_of::<ticcmd_t>() / 4).saturating_sub(1);
-        for i in 0..count {
-            sum = sum.wrapping_add(*ptr.add(i));
-        }
-        sum
+    if cmd.is_null() {
+        return 0;
     }
+    let count = (size_of::<ticcmd_t>() / 4).saturating_sub(1);
+    let words = unsafe { std::slice::from_raw_parts(cmd as *const c_int, count) };
+    words.iter().fold(0, |acc, &w| acc.wrapping_add(w))
 }
 
-// --- G_BuildTiccmd ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn G_BuildTiccmd(cmd: *mut ticcmd_t) {
-    unsafe {
-        let base = I_BaseTiccmd();
-        ptr::copy_nonoverlapping(base, cmd, 1);
-
-        (*cmd).consistancy =
-            consistancy[consoleplayer as usize][(maketic as usize) % BACKUP_TICS];
-
-        let kd = (&raw const gamekeydown) as *const c_int;
-        let mb = mousebuttons;
-        let jb = joybuttons;
-
-        let strafe = *kd.add(key_strafe as usize) != 0
-            || *mb.offset(mousebstrafe as isize) != 0
-            || *jb.offset(joybstrafe as isize) != 0;
-
-        let speed: usize =
-            (*kd.add(key_speed as usize) == 0 || *jb.offset(joybspeed as isize) != 0) as usize;
-
-        let mut forward: c_int = 0;
-        let mut side: c_int = 0;
-
-        if joyxmove != 0
-            || *kd.add(key_right as usize) != 0
-            || *kd.add(key_left as usize) != 0
-        {
-            turnheld += ticdup;
-        } else {
-            turnheld = 0;
-        }
-
-        let tspeed: usize = if turnheld < SLOWTURNTICS { 2 } else { speed };
-
-        let fwd_spd = forwardmove[speed];
-        let side_spd = sidemove[speed];
-        let turn_spd = angleturn[tspeed] as c_short;
-        let maxplmove = forwardmove[1];
+let Some(c) = (unsafe { cmd.as_mut() }) else { return };
+unsafe {
+let base = I_BaseTiccmd();
+*c = *base;
+c.consistancy = consistancy[consoleplayer as usize][(maketic as usize) % BACKUP_TICS];
+let kd = (&raw const gamekeydown).as_ref().unwrap();
+let mb = mousebuttons;
+let jb = joybuttons;
+let strafe = kd[key_strafe as usize] != 0
+|| *mb.offset(mousebstrafe as isize) != 0
+|| *jb.offset(joybstrafe as isize) != 0;
+let speed: usize =
+(kd[key_speed as usize] == 0 || *jb.offset(joybspeed as isize) != 0) as usize;
+let mut forward: c_int = 0;
+let mut side: c_int = 0;
+if joyxmove != 0 || kd[key_right as usize] != 0 || kd[key_left as usize] != 0 {
+turnheld += ticdup;
+} else {
+turnheld = 0;
+}
+let tspeed: usize = if turnheld < SLOWTURNTICS { 2 } else { speed };
+let fwd_spd = forwardmove[speed];
+let side_spd = sidemove[speed];
+let turn_spd = angleturn[tspeed] as c_short;
+let maxplmove = forwardmove[1];
 if strafe {
-if *kd.add(key_right as usize) != 0 {
+if kd[key_right as usize] != 0 {
 side += side_spd;
 }
-if *kd.add(key_left as usize) != 0 {
+if kd[key_left as usize] != 0 {
 side -= side_spd;
 }
 if joyxmove > 0 {
@@ -368,23 +411,23 @@ if joyxmove < 0 {
 side -= side_spd;
 }
 } else {
-if *kd.add(key_right as usize) != 0 {
-(*cmd).angleturn = (*cmd).angleturn.wrapping_sub(turn_spd);
+if kd[key_right as usize] != 0 {
+c.angleturn = c.angleturn.wrapping_sub(turn_spd);
 }
-if *kd.add(key_left as usize) != 0 {
-(*cmd).angleturn = (*cmd).angleturn.wrapping_add(turn_spd);
+if kd[key_left as usize] != 0 {
+c.angleturn = c.angleturn.wrapping_add(turn_spd);
 }
 if joyxmove > 0 {
-(*cmd).angleturn = (*cmd).angleturn.wrapping_sub(turn_spd);
+c.angleturn = c.angleturn.wrapping_sub(turn_spd);
 }
 if joyxmove < 0 {
-(*cmd).angleturn = (*cmd).angleturn.wrapping_add(turn_spd);
+c.angleturn = c.angleturn.wrapping_add(turn_spd);
 }
 }
-if *kd.add(key_up as usize) != 0 {
+if kd[key_up as usize] != 0 {
 forward += fwd_spd;
 }
-if *kd.add(key_down as usize) != 0 {
+if kd[key_down as usize] != 0 {
 forward -= fwd_spd;
 }
 if joyymove < 0 {
@@ -393,30 +436,30 @@ forward += fwd_spd;
 if joyymove > 0 {
 forward -= fwd_spd;
 }
-if *kd.add(key_strafeleft as usize) != 0 {
+if kd[key_strafeleft as usize] != 0 {
 side -= side_spd;
 }
-if *kd.add(key_straferight as usize) != 0 {
+if kd[key_straferight as usize] != 0 {
 side += side_spd;
 }
-(*cmd).chatchar = HU_dequeueChatChar() as u8;
-if *kd.add(key_fire as usize) != 0
+c.chatchar = HU_dequeueChatChar() as u8;
+if kd[key_fire as usize] != 0
 || *mb.offset(mousebfire as isize) != 0
 || *jb.offset(joybfire as isize) != 0
 {
-(*cmd).buttons |= BT_ATTACK as u8;
+c.buttons |= BT_ATTACK as u8;
 }
-if *kd.add(key_use as usize) != 0
-|| *kd.add(b' ' as usize) != 0
+if kd[key_use as usize] != 0
+|| kd[b' ' as usize] != 0
 || *jb.offset(joybuse as isize) != 0
 {
-(*cmd).buttons |= BT_USE as u8;
+c.buttons |= BT_USE as u8;
 dclicks = 0;
 }
-for i in 0..((NUM_WEAPONS - 1) as usize) {
-if *kd.add((b'1' as usize) + i) != 0 {
-(*cmd).buttons |= BT_CHANGE as u8;
-(*cmd).buttons |= (i << BT_WEAPONSHIFT) as u8;
+for i in 0..(NUM_WEAPONS - 1) {
+if kd[(b'1' as usize) + i] != 0 {
+c.buttons |= BT_CHANGE as u8;
+c.buttons |= (i << BT_WEAPONSHIFT) as u8;
 break;
 }
 }
@@ -430,7 +473,7 @@ if dclickstate != 0 {
 dclicks += 1;
 }
 if dclicks == 2 {
-(*cmd).buttons |= BT_USE as u8;
+c.buttons |= BT_USE as u8;
 dclicks = 0;
 } else {
 dclicktime = 0;
@@ -450,7 +493,7 @@ if dclickstate2 != 0 {
 dclicks2 += 1;
 }
 if dclicks2 == 2 {
-(*cmd).buttons |= BT_USE as u8;
+c.buttons |= BT_USE as u8;
 dclicks2 = 0;
 } else {
 dclicktime2 = 0;
@@ -465,36 +508,35 @@ dclickstate2 = 0;
 if strafe {
 side += mousex * 2;
 } else {
-(*cmd).angleturn = (*cmd).angleturn.wrapping_sub((mousex * 0x8) as c_short);
+c.angleturn = c.angleturn.wrapping_sub((mousex * 0x8) as c_short);
 }
 mousex = 0;
 mousey = 0;
 forward = forward.clamp(-maxplmove, maxplmove);
 side = side.clamp(-maxplmove, maxplmove);
-(*cmd).forwardmove = (*cmd).forwardmove.wrapping_add(forward as i8);
-(*cmd).sidemove = (*cmd).sidemove.wrapping_add(side as i8);
+c.forwardmove = c.forwardmove.wrapping_add(forward as i8);
+c.sidemove = c.sidemove.wrapping_add(side as i8);
 if sendpause != 0 {
 sendpause = 0;
-(*cmd).buttons = (BT_SPECIAL | BTS_PAUSE) as u8;
+c.buttons = (BT_SPECIAL | BTS_PAUSE) as u8;
 }
 if sendsave != 0 {
 sendsave = 0;
-(*cmd).buttons =
+c.buttons =
 (BT_SPECIAL | BTS_SAVEGAME | ((savegameslot as u32) << BTS_SAVESHIFT)) as u8;
 }
 }
 }
-// --- G_DoLoadLevel ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn G_DoLoadLevel() {
 unsafe {
-skyflatnum = R_FlatNumForName(SKYFLATNAME.as_ptr() as *mut c_char);
-if gamemode == commercial {
-skytexture = R_TextureNumForName(b"SKY3\0".as_ptr() as *mut c_char);
+set_sky_flat_num(R_FlatNumForName(SKYFLATNAME.as_ptr() as *mut c_char));
+if get_gamemode() == commercial {
+set_sky_texture(R_TextureNumForName(b"SKY3\0".as_ptr() as *mut c_char));
 if gamemap < 12 {
-skytexture = R_TextureNumForName(b"SKY1\0".as_ptr() as *mut c_char);
+set_sky_texture(R_TextureNumForName(b"SKY1\0".as_ptr() as *mut c_char));
 } else if gamemap < 21 {
-skytexture = R_TextureNumForName(b"SKY2\0".as_ptr() as *mut c_char);
+set_sky_texture(R_TextureNumForName(b"SKY2\0".as_ptr() as *mut c_char));
 }
 }
 levelstarttic = gametic;
@@ -502,21 +544,22 @@ if wipegamestate == GS_LEVEL {
 wipegamestate = -1i32 as gamestate_t;
 }
 gamestate = GS_LEVEL;
-let in_game_ptr = (&raw const playeringame) as *const c_int;
-let players_base = (&raw mut players) as *mut player_t;
+let in_game = (&raw const playeringame).as_ref().unwrap();
+let players_arr = (&raw mut players).as_mut().unwrap();
 for i in 0..NUM_PLAYERS {
-let p = players_base.add(i);
-if *in_game_ptr.add(i) != 0 && (*p).playerstate == (PST_DEAD as c_int) {
-(*p).playerstate = (PST_REBORN as c_int);
+                let p_mo = players_arr[i].mo;
+            let p = &mut players_arr[i];
+if in_game[i] != 0 && p.playerstate == (PST_DEAD as c_int) {
+p.playerstate = PST_REBORN as c_int;
 }
-ptr::write_bytes((&raw mut (*p).frags) as *mut c_int, 0, NUM_PLAYERS);
+p.frags.fill(0);
 }
 P_SetupLevel(gameepisode, gamemap, 0, gameskill);
 displayplayer = consoleplayer;
 starttime = I_GetTime();
 gameaction = ga_nothing;
 Z_CheckHeap();
-ptr::write_bytes((&raw mut gamekeydown) as *mut c_int, 0, NUMKEYS);
+(&raw mut gamekeydown).as_mut().unwrap().fill(0);
 joyxmove = 0;
 joyymove = 0;
 mousex = 0;
@@ -524,28 +567,28 @@ mousey = 0;
 sendpause = 0;
 sendsave = 0;
 paused = 0;
-ptr::write_bytes(mousebuttons, 0, 3);
-ptr::write_bytes(joybuttons, 0, 4);
+(&raw mut mousearray).as_mut().unwrap().fill(0);
+(&raw mut joyarray).as_mut().unwrap().fill(0);
 }
 }
-// --- G_Responder ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn G_Responder(ev: *mut event_t) -> c_int {
+let Some(ev_ref) = (unsafe { ev.as_ref() }) else { return 0 };
 unsafe {
-let ev_type = (*ev).type_;
-let data1 = (*ev).data1;
+let ev_type = ev_ref.type_;
+let data1 = ev_ref.data1;
 if gamestate == GS_LEVEL
 && ev_type == ev_keydown
 && (data1 as u32) == KEY_F12
 && (singledemo != 0 || deathmatch == 0)
 {
-let in_game_ptr = (&raw const playeringame) as *const c_int;
+let in_game = (&raw const playeringame).as_ref().unwrap();
 loop {
 displayplayer += 1;
 if displayplayer == (MAXPLAYERS as c_int) {
 displayplayer = 0;
 }
-if *in_game_ptr.add(displayplayer as usize) != 0 || displayplayer == consoleplayer {
+if in_game[displayplayer as usize] != 0 || displayplayer == consoleplayer {
 break;
 }
 }
@@ -585,15 +628,13 @@ sendpause = 1;
 return 1;
 }
 if (data1 as usize) < NUMKEYS {
-let kd = (&raw mut gamekeydown) as *mut c_int;
-*kd.add(data1 as usize) = 1;
+(&raw mut gamekeydown).as_mut().unwrap()[data1 as usize] = 1;
 }
 1
 }
 ev_keyup => {
 if (data1 as usize) < NUMKEYS {
-let kd = (&raw mut gamekeydown) as *mut c_int;
-*kd.add(data1 as usize) = 0;
+(&raw mut gamekeydown).as_mut().unwrap()[data1 as usize] = 0;
 }
 0
 }
@@ -601,8 +642,8 @@ ev_mouse => {
 *mousebuttons.offset(0) = data1 & 1;
 *mousebuttons.offset(1) = data1 & 2;
 *mousebuttons.offset(2) = data1 & 4;
-mousex = (*ev).data2 * (mouseSensitivity + 5) / 10;
-mousey = (*ev).data3 * (mouseSensitivity + 5) / 10;
+mousex = ev_ref.data2 * (mouseSensitivity + 5) / 10;
+mousey = ev_ref.data3 * (mouseSensitivity + 5) / 10;
 1
 }
 ev_joystick => {
@@ -610,23 +651,22 @@ ev_joystick => {
 *joybuttons.offset(1) = data1 & 2;
 *joybuttons.offset(2) = data1 & 4;
 *joybuttons.offset(3) = data1 & 8;
-joyxmove = (*ev).data2;
-joyymove = (*ev).data3;
+joyxmove = ev_ref.data2;
+joyymove = ev_ref.data3;
 1
 }
 _ => 0,
 }
 }
 }
-// --- G_Ticker ---
 static mut TURBOMESSAGE: [c_char; 80] = [0; 80];
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn G_Ticker() {
 unsafe {
-let in_game_ptr = (&raw const playeringame) as *const c_int;
-let players_base = (&raw mut players) as *mut player_t;
+let in_game = (&raw const playeringame).as_ref().unwrap();
+let players_arr = (&raw mut players).as_mut().unwrap();
 for i in 0..NUM_PLAYERS {
-if *in_game_ptr.add(i) != 0 && (*players_base.add(i)).playerstate == (PST_REBORN as c_int) {
+if in_game[i] != 0 && players_arr[i].playerstate == (PST_REBORN as c_int) {
 G_DoReborn(i as c_int);
 }
 }
@@ -648,13 +688,12 @@ _ => {}
 }
 }
 let buf = ((gametic / ticdup) as usize) % BACKUP_TICS;
-let netcmds_base = (&raw const netcmds) as *const [ticcmd_t; BACKUP_TICS];
+let netcmds_arr = (&raw const netcmds).as_ref().unwrap();
 for i in 0..NUM_PLAYERS {
-if *in_game_ptr.add(i) != 0 {
-let p = players_base.add(i);
-let cmd = (&raw mut (*p).cmd) as *mut ticcmd_t;
-let src_cmd = &raw const (*netcmds_base.add(i))[buf];
-ptr::copy_nonoverlapping(src_cmd, cmd, 1);
+if in_game[i] != 0 {
+                let p_mo = players_arr[i].mo;
+                let cmd = (&raw mut players_arr[i].cmd) as *mut ticcmd_t;
+*cmd = netcmds_arr[i][buf];
 if demoplayback != 0 {
 G_ReadDemoTiccmd(cmd);
 }
@@ -665,13 +704,15 @@ if (*cmd).forwardmove > TURBOTHRESHOLD
 && (gametic & 31) == 0
 && ((gametic >> 5) & 3) == (i as c_int)
 {
-let pnames_ptr = (&raw const player_names) as *const *mut c_char;
-let pname = CStr::from_ptr(*pnames_ptr.add(i)).to_str().unwrap_or("Player");
+let pnames_arr = (&raw const player_names).as_ref().unwrap();
+let pname = CStr::from_ptr(pnames_arr[i]).to_str().unwrap_or("Player");
 let msg = format!("{} is turbo!\0", pname);
-let dst = (&raw mut TURBOMESSAGE) as *mut c_char;
-let len = msg.len().min(79);
-ptr::copy_nonoverlapping(msg.as_ptr() as *const c_char, dst, len);
-(*players_base.add(consoleplayer as usize)).message = dst;
+let dst = (&raw mut TURBOMESSAGE).as_mut().unwrap();
+dst.fill(0);
+for (d, &b) in dst.iter_mut().zip(msg.as_bytes()).take(79) {
+*d = b as c_char;
+}
+players_arr[consoleplayer as usize].message = dst.as_mut_ptr();
 }
 if netgame != 0 && netdemo == 0 && (gametic % ticdup) == 0 {
 if gametic > (BACKUPTICS as c_int)
@@ -679,20 +720,21 @@ if gametic > (BACKUPTICS as c_int)
 {
 doom_error(&format!(
 "consistency failure ({} should be {})",
-(*cmd).consistancy, consistancy[i][buf]
+(*cmd).consistancy,
+consistancy[i][buf]
 ));
 }
-if !(*p).mo.is_null() {
-consistancy[i][buf] = (*(*p).mo).x as c_short;
+if !p_mo.is_null() {
+consistancy[i][buf] = (*p_mo).x as c_short;
 } else {
-consistancy[i][buf] = rndindex as c_short;
+consistancy[i][buf] = get_rnd_index() as c_short;
 }
 }
 }
 }
 for i in 0..NUM_PLAYERS {
-if *in_game_ptr.add(i) != 0 {
-let btns = (*((&raw const (*players_base.add(i)).cmd) as *const ticcmd_t)).buttons as u32;
+if in_game[i] != 0 {
+let btns = players_arr[i].cmd[7] as u32;
 if (btns & BT_SPECIAL) != 0 {
 match btns & BT_SPECIALMASK {
 BTS_PAUSE => {
@@ -704,14 +746,12 @@ S_ResumeSound();
 }
 }
 BTS_SAVEGAME => {
-let desc_ptr = (&raw mut savedescription) as *mut c_char;
-if *desc_ptr == 0 {
+let desc = (&raw mut savedescription).as_mut().unwrap();
+if desc[0] == 0 {
 let net_str = b"NET GAME\0";
-ptr::copy_nonoverlapping(
-net_str.as_ptr() as *const c_char,
-desc_ptr,
-net_str.len(),
-);
+for (d, &b) in desc.iter_mut().zip(net_str) {
+*d = b as c_char;
+}
 }
 savegameslot = ((btns & BTS_SAVEMASK) >> BTS_SAVESHIFT) as c_int;
 gameaction = ga_savegame;
@@ -735,7 +775,6 @@ _ => {}
 }
 }
 }
-// --- Player Init / Finish / Reborn ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn G_InitPlayer(player: c_int) {
 unsafe {
@@ -745,86 +784,81 @@ G_PlayerReborn(player);
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn G_PlayerFinishLevel(player: c_int) {
 unsafe {
-let players_base = (&raw mut players) as *mut player_t;
-let p = players_base.add(player as usize);
-ptr::write_bytes((&raw mut (*p).powers) as *mut c_int, 0, NUMPOWERS as usize);
-ptr::write_bytes((&raw mut (*p).cards) as *mut c_int, 0, NUMCARDS as usize);
-(*(*p).mo).flags &= !(MF_SHADOW as c_int);
-(*p).extralight = 0;
-(*p).fixedcolormap = 0;
-(*p).damagecount = 0;
-(*p).bonuscount = 0;
+let p = &mut (&raw mut players).as_mut().unwrap()[player as usize];
+p.powers.fill(0);
+p.cards.fill(0);
+(*p.mo).flags &= !(MF_SHADOW as c_int);
+p.extralight = 0;
+p.fixedcolormap = 0;
+p.damagecount = 0;
+p.bonuscount = 0;
 }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn G_PlayerReborn(player: c_int) {
 unsafe {
-let players_base = (&raw mut players) as *mut player_t;
-let p = players_base.add(player as usize);
-let mut frags = [0 as c_int; NUM_PLAYERS];
-ptr::copy_nonoverlapping((&raw const (*p).frags) as *const c_int, frags.as_mut_ptr(), NUM_PLAYERS);
-let killcount = (*p).killcount;
-let itemcount = (*p).itemcount;
-let secretcount = (*p).secretcount;
-ptr::write_bytes(p, 0, 1);
-ptr::copy_nonoverlapping(frags.as_ptr(), (&raw mut (*p).frags) as *mut c_int, NUM_PLAYERS);
-(*p).killcount = killcount;
-(*p).itemcount = itemcount;
-(*p).secretcount = secretcount;
-(*p).usedown = 1;
-(*p).attackdown = 1;
-(*p).playerstate = (PST_LIVE as c_int);
-(*p).health = MAXHEALTH as c_int;
-(*p).readyweapon = wp_pistol as c_int;
-(*p).pendingweapon = wp_pistol as c_int;
-(*p).weaponowned[wp_fist as usize] = 1;
-(*p).weaponowned[wp_pistol as usize] = 1;
-(*p).ammo[am_clip as usize] = 50;
-let max_ptr = (&raw const maxammo) as *const c_int;
-for i in 0..NUM_AMMO {
-(*p).maxammo[i] = *max_ptr.add(i);
+let p = &mut (&raw mut players).as_mut().unwrap()[player as usize];
+let frags = p.frags;
+let killcount = p.killcount;
+let itemcount = p.itemcount;
+let secretcount = p.secretcount;
+*p = EMPTY_PLAYER;
+p.frags = frags;
+p.killcount = killcount;
+p.itemcount = itemcount;
+p.secretcount = secretcount;
+p.usedown = 1;
+p.attackdown = 1;
+p.playerstate = PST_LIVE as c_int;
+p.health = MAXHEALTH as c_int;
+p.readyweapon = wp_pistol as c_int;
+p.pendingweapon = wp_pistol as c_int;
+p.weaponowned[wp_fist as usize] = 1;
+p.weaponowned[wp_pistol as usize] = 1;
+p.ammo[am_clip as usize] = 50;
+p.maxammo = maxammo;
 }
 }
-}
-// --- Spawn & Deathmatch ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn G_CheckSpot(playernum: c_int, mthing: *mut mapthing_t) -> c_int {
+let Some(mt) = (unsafe { mthing.as_ref() }) else { return 0 };
 unsafe {
-let players_base = (&raw const players) as *const player_t;
-let p_cur = players_base.add(playernum as usize);
-if (*p_cur).mo.is_null() {
+let players_arr = (&raw const players).as_ref().unwrap();
+let p_cur = &players_arr[playernum as usize];
+if p_cur.mo.is_null() {
 for i in 0..(playernum as usize) {
-let mo_i = (*players_base.add(i)).mo;
-if (*mo_i).x == (((*mthing).x as c_int) << FRACBITS)
-&& (*mo_i).y == (((*mthing).y as c_int) << FRACBITS)
+let mo_i = &*players_arr[i].mo;
+if mo_i.x == ((mt.x as c_int) << FRACBITS)
+&& mo_i.y == ((mt.y as c_int) << FRACBITS)
 {
 return 0;
 }
 }
 return 1;
 }
-let x = ((*mthing).x as c_int) << FRACBITS;
-let y = ((*mthing).y as c_int) << FRACBITS;
-if P_CheckPosition((*p_cur).mo as *mut _, x, y) == 0 {
+let x = (mt.x as c_int) << FRACBITS;
+let y = (mt.y as c_int) << FRACBITS;
+if P_CheckPosition(p_cur.mo as *mut _, x, y) == 0 {
 return 0;
 }
-let bq_ptr = (&raw mut bodyque) as *mut *mut mobj_t;
+let bq = (&raw mut bodyque).as_mut().unwrap();
+let bq_idx = (bodyqueslot as usize) % BODYQUESIZE;
 if bodyqueslot >= (BODYQUESIZE as c_int) {
-P_RemoveMobj(*bq_ptr.add((bodyqueslot as usize) % BODYQUESIZE) as *mut _);
+P_RemoveMobj(bq[bq_idx] as *mut _);
 }
-*bq_ptr.add((bodyqueslot as usize) % BODYQUESIZE) = (*p_cur).mo as *mut mobj_t;
+bq[bq_idx] = p_cur.mo as *mut mobj_t;
 bodyqueslot += 1;
 let ss = R_PointInSubsector(x, y);
-let an = (ANG45.wrapping_mul((((*mthing).angle as c_int) / 45) as u32)) >> ANGLETOFINESHIFT;
-let cos_v = *finesine.as_ptr().add((an as usize) + ((FINEANGLES as usize) / 4));
-let sin_v = *finesine.as_ptr().add(an as usize);
+let an = (ANG45.wrapping_mul(((mt.angle as c_int) / 45) as u32)) >> ANGLETOFINESHIFT;
+let cos_v = finesine[(an as usize) + QUARTER_FINE];
+let sin_v = finesine[an as usize];
 let mo = P_SpawnMobj(
 x + 20 * cos_v,
 y + 20 * sin_v,
 (*(*ss).sector).floorheight,
 MT_TFOG,
 );
-if (*players_base.add(consoleplayer as usize)).viewz != 1 {
+if players_arr[consoleplayer as usize].viewz != 1 {
 S_StartSound(mo as *mut c_void, sfx_telept as c_int);
 }
 1
@@ -847,8 +881,8 @@ P_SpawnPlayer(spot);
 return;
 }
 }
-let pstarts = (&raw mut playerstarts) as *mut mapthing_t;
-P_SpawnPlayer(pstarts.add(playernum as usize));
+let pstarts = (&raw mut playerstarts).as_mut().unwrap();
+P_SpawnPlayer(&mut pstarts[playernum as usize]);
 }
 }
 #[unsafe(no_mangle)]
@@ -857,27 +891,26 @@ unsafe {
 if netgame == 0 {
 gameaction = ga_loadlevel;
 } else {
-let players_base = (&raw mut players) as *mut player_t;
-(*(*players_base.add(playernum as usize)).mo).player = ptr::null_mut();
+let players_arr = (&raw mut players).as_mut().unwrap();
+(*players_arr[playernum as usize].mo).player = ptr::null_mut();
 if deathmatch != 0 {
 G_DeathMatchSpawnPlayer(playernum);
 return;
 }
-let pstarts = (&raw mut playerstarts) as *mut mapthing_t;
-if G_CheckSpot(playernum, pstarts.add(playernum as usize)) != 0 {
-P_SpawnPlayer(pstarts.add(playernum as usize));
+let pstarts = (&raw mut playerstarts).as_mut().unwrap();
+if G_CheckSpot(playernum, &mut pstarts[playernum as usize]) != 0 {
+P_SpawnPlayer(&mut pstarts[playernum as usize]);
 return;
 }
 for i in 0..NUM_PLAYERS {
-let spot = pstarts.add(i);
-if G_CheckSpot(playernum, spot) != 0 {
-(*spot).type_ = (playernum + 1) as c_short;
-P_SpawnPlayer(spot);
-(*spot).type_ = (i + 1) as c_short;
+if G_CheckSpot(playernum, &mut pstarts[i]) != 0 {
+pstarts[i].type_ = (playernum + 1) as c_short;
+P_SpawnPlayer(&mut pstarts[i]);
+pstarts[i].type_ = (i + 1) as c_short;
 return;
 }
 }
-P_SpawnPlayer(pstarts.add(playernum as usize));
+P_SpawnPlayer(&mut pstarts[playernum as usize]);
 }
 }
 }
@@ -887,7 +920,6 @@ unsafe {
 gameaction = ga_screenshot;
 }
 }
-// --- Par Times & Level Completion ---
 #[unsafe(no_mangle)]
 pub static mut pars: [[c_int; 10]; 4] = [
     [0; 10],
@@ -895,13 +927,10 @@ pub static mut pars: [[c_int; 10]; 4] = [
     [0, 90, 90, 90, 120, 90, 360, 240, 30, 170],
     [0, 90, 45, 90, 150, 90, 90, 165, 30, 135],
 ];
-
 #[unsafe(no_mangle)]
 pub static mut cpars: [c_int; 32] = [
-30, 90, 120, 120, 90, 150, 120, 120, 270, 90,
-210, 150, 150, 150, 210, 150, 420, 150, 210, 150,
-240, 150, 180, 150, 150, 300, 330, 420, 300, 180,
-120, 30,
+30, 90, 120, 120, 90, 150, 120, 120, 270, 90, 210, 150, 150, 150, 210, 150, 420, 150, 210, 150,
+240, 150, 180, 150, 150, 300, 330, 420, 300, 180, 120, 30,
 ];
 #[unsafe(no_mangle)]
 pub static mut secretexit: c_int = 0;
@@ -915,7 +944,7 @@ gameaction = ga_completed;
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn G_SecretExitLevel() {
 unsafe {
-if gamemode == commercial && W_CheckNumForName(b"map31\0".as_ptr() as *mut c_char) < 0 {
+if get_gamemode() == commercial && w_check_num_for_name("map31") < 0 {
 secretexit = 0;
 } else {
 secretexit = 1;
@@ -927,34 +956,34 @@ gameaction = ga_completed;
 pub unsafe extern "C" fn G_DoCompleted() {
 unsafe {
 gameaction = ga_nothing;
-let in_game_ptr = (&raw const playeringame) as *const c_int;
-let players_base = (&raw mut players) as *mut player_t;
+let in_game = (&raw const playeringame).as_ref().unwrap();
+let players_arr = (&raw mut players).as_mut().unwrap();
 for i in 0..NUM_PLAYERS {
-if *in_game_ptr.add(i) != 0 {
+if in_game[i] != 0 {
 G_PlayerFinishLevel(i as c_int);
 }
 }
 if automapactive != 0 {
 AM_Stop();
 }
-if gamemode != commercial {
+if get_gamemode() != commercial {
 match gamemap {
 8 => {
 gameaction = ga_victory;
 return;
 }
 9 => {
-for i in 0..NUM_PLAYERS {
-(*players_base.add(i)).didsecret = 1;
+for p in players_arr.iter_mut() {
+p.didsecret = 1;
 }
 }
 _ => {}
 }
 }
-wminfo.didsecret = (*players_base.add(consoleplayer as usize)).didsecret;
+wminfo.didsecret = players_arr[consoleplayer as usize].didsecret;
 wminfo.epsd = gameepisode - 1;
 wminfo.last = gamemap - 1;
-if gamemode == commercial {
+if get_gamemode() == commercial {
 if secretexit != 0 {
 match gamemap {
 15 => wminfo.next = 30,
@@ -984,7 +1013,7 @@ wminfo.maxkills = totalkills;
 wminfo.maxitems = totalitems;
 wminfo.maxsecret = totalsecret;
 wminfo.maxfrags = 0;
-if gamemode == commercial {
+if get_gamemode() == commercial {
 wminfo.partime = 35 * cpars[(gamemap - 1).clamp(0, 31) as usize];
 } else {
 let ep = gameepisode.clamp(0, 3) as usize;
@@ -993,23 +1022,19 @@ wminfo.partime = 35 * pars[ep][mp];
 }
 wminfo.pnum = consoleplayer;
 for i in 0..NUM_PLAYERS {
-let pl = &*players_base.add(i);
-wminfo.plyr[i].in_ = *in_game_ptr.add(i);
+let pl = &players_arr[i];
+wminfo.plyr[i].in_ = in_game[i];
 wminfo.plyr[i].skills = pl.killcount;
 wminfo.plyr[i].sitems = pl.itemcount;
 wminfo.plyr[i].ssecret = pl.secretcount;
-wminfo.plyr[i].stime = leveltime;
-ptr::copy_nonoverlapping(
-(&raw const pl.frags) as *const c_int,
-(&raw mut wminfo.plyr[i].frags) as *mut c_int,
-NUM_PLAYERS,
-);
+wminfo.plyr[i].stime = get_leveltime();
+wminfo.plyr[i].frags = pl.frags;
 }
 gamestate = GS_INTERMISSION;
 viewactive = 0;
 automapactive = 0;
 if !statcopy.is_null() {
-ptr::copy_nonoverlapping(&raw const wminfo, statcopy as *mut wbstartstruct_t, 1);
+*(statcopy as *mut wbstartstruct_t) = wminfo;
 }
 WI_Start((&raw mut wminfo) as *mut _);
 }
@@ -1018,11 +1043,11 @@ WI_Start((&raw mut wminfo) as *mut _);
 pub unsafe extern "C" fn G_WorldDone() {
 unsafe {
 gameaction = ga_worlddone;
-let players_base = (&raw mut players) as *mut player_t;
+let players_arr = (&raw mut players).as_mut().unwrap();
 if secretexit != 0 {
-(*players_base.add(consoleplayer as usize)).didsecret = 1;
+players_arr[consoleplayer as usize].didsecret = 1;
 }
-if gamemode == commercial {
+if get_gamemode() == commercial {
 match gamemap {
 15 | 31 => {
 if secretexit != 0 {
@@ -1047,16 +1072,20 @@ gameaction = ga_nothing;
 viewactive = 1;
 }
 }
-// --- Save / Load Game ---
 #[unsafe(no_mangle)]
 pub static mut savename: [c_char; 256] = [0; 256];
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn G_LoadGame(name: *mut c_char) {
+if name.is_null() {
+return;
+}
+let src = unsafe { CStr::from_ptr(name).to_bytes_with_nul() };
 unsafe {
-let src = CStr::from_ptr(name).to_bytes_with_nul();
-let dst = (&raw mut savename) as *mut c_char;
-let len = src.len().min(256);
-ptr::copy_nonoverlapping(src.as_ptr() as *const c_char, dst, len);
+let dst = (&raw mut savename).as_mut().unwrap();
+dst.fill(0);
+for (d, &b) in dst.iter_mut().zip(src).take(255) {
+*d = b as c_char;
+}
 gameaction = ga_loadgame;
 }
 }
@@ -1064,8 +1093,7 @@ gameaction = ga_loadgame;
 pub unsafe extern "C" fn G_DoLoadGame() {
 unsafe {
 gameaction = ga_nothing;
-let sn_ptr = (&raw mut savename) as *mut c_char;
-M_ReadFile(sn_ptr, &raw mut savebuffer);
+M_ReadFile((&raw mut savename) as *mut c_char, &raw mut savebuffer);
 save_p = savebuffer.add(SAVESTRINGSIZE);
 let vcheck = format!("version {}\0", VERSION);
 let save_v = CStr::from_ptr(save_p as *const c_char);
@@ -1079,9 +1107,9 @@ gameepisode = (*save_p) as c_int;
 save_p = save_p.add(1);
 gamemap = (*save_p) as c_int;
 save_p = save_p.add(1);
-let in_game_ptr = (&raw mut playeringame) as *mut c_int;
-for i in 0..NUM_PLAYERS {
-*in_game_ptr.add(i) = (*save_p) as c_int;
+let in_game = (&raw mut playeringame).as_mut().unwrap();
+for slot in in_game.iter_mut() {
+*slot = (*save_p) as c_int;
 save_p = save_p.add(1);
 }
 G_InitNew(gameskill, gameepisode, gamemap);
@@ -1091,7 +1119,7 @@ let b = (*save_p) as c_int;
 save_p = save_p.add(1);
 let c = (*save_p) as c_int;
 save_p = save_p.add(1);
-leveltime = (a << 16) + (b << 8) + c;
+set_leveltime((a << 16) + (b << 8) + c);
 P_UnArchivePlayers();
 P_UnArchiveWorld();
 P_UnArchiveThinkers();
@@ -1108,12 +1136,17 @@ R_FillBackScreen();
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn G_SaveGame(slot: c_int, description: *mut c_char) {
+if description.is_null() {
+return;
+}
+let src = unsafe { CStr::from_ptr(description).to_bytes_with_nul() };
 unsafe {
 savegameslot = slot;
-let src = CStr::from_ptr(description).to_bytes_with_nul();
-let dst = (&raw mut savedescription) as *mut c_char;
-let len = src.len().min(32);
-ptr::copy_nonoverlapping(src.as_ptr() as *const c_char, dst, len);
+let dst = (&raw mut savedescription).as_mut().unwrap();
+dst.fill(0);
+for (d, &b) in dst.iter_mut().zip(src).take(31) {
+*d = b as c_char;
+}
 sendsave = 1;
 }
 }
@@ -1128,14 +1161,14 @@ format!("{}{}.dsg\0", SAVEGAMENAME_STR, savegameslot)
 let scr_ptr = (&raw const screens) as *const *mut u8;
 savebuffer = (*scr_ptr.add(1)).add(0x4000);
 save_p = savebuffer;
-let desc_ptr = (&raw mut savedescription) as *mut c_char;
-ptr::copy_nonoverlapping(desc_ptr as *const u8, save_p, SAVESTRINGSIZE);
+let desc = (&raw mut savedescription).as_mut().unwrap();
+ptr::copy_nonoverlapping(desc.as_ptr() as *const u8, save_p, SAVESTRINGSIZE);
 save_p = save_p.add(SAVESTRINGSIZE);
 let mut name2 = [0u8; VERSIONSIZE];
 let v_str = format!("version {}", VERSION);
 let v_bytes = v_str.as_bytes();
 let v_len = v_bytes.len().min(VERSIONSIZE - 1);
-ptr::copy_nonoverlapping(v_bytes.as_ptr(), name2.as_mut_ptr(), v_len);
+name2[..v_len].copy_from_slice(&v_bytes[..v_len]);
 ptr::copy_nonoverlapping(name2.as_ptr(), save_p, VERSIONSIZE);
 save_p = save_p.add(VERSIONSIZE);
 *save_p = gameskill as u8;
@@ -1144,16 +1177,17 @@ save_p = save_p.add(1);
 save_p = save_p.add(1);
 *save_p = gamemap as u8;
 save_p = save_p.add(1);
-let in_game_ptr = (&raw const playeringame) as *const c_int;
-for i in 0..NUM_PLAYERS {
-*save_p = (*in_game_ptr.add(i)) as u8;
+let in_game = (&raw const playeringame).as_ref().unwrap();
+for &ig in in_game {
+*save_p = ig as u8;
 save_p = save_p.add(1);
 }
-*save_p = (leveltime >> 16) as u8;
+let lt = get_leveltime();
+*save_p = (lt >> 16) as u8;
 save_p = save_p.add(1);
-*save_p = (leveltime >> 8) as u8;
+*save_p = (lt >> 8) as u8;
 save_p = save_p.add(1);
-*save_p = leveltime as u8;
+*save_p = lt as u8;
 save_p = save_p.add(1);
 P_ArchivePlayers();
 P_ArchiveWorld();
@@ -1165,15 +1199,18 @@ let length = save_p.offset_from(savebuffer) as usize;
 if length > SAVEGAMESIZE {
 doom_error("Savegame buffer overrun");
 }
-M_WriteFile(name.as_ptr() as *mut c_char, savebuffer as *mut c_void, length as c_int);
+M_WriteFile(
+name.as_ptr() as *mut c_char,
+savebuffer as *mut c_void,
+length as c_int,
+);
 gameaction = ga_nothing;
-*desc_ptr = 0;
-let players_base = (&raw mut players) as *mut player_t;
-(*players_base.add(consoleplayer as usize)).message = GGSAVED_STR.as_ptr() as *mut c_char;
+desc[0] = 0;
+let players_arr = (&raw mut players).as_mut().unwrap();
+players_arr[consoleplayer as usize].message = GGSAVED_STR.as_ptr() as *mut c_char;
 R_FillBackScreen();
 }
 }
-// --- G_InitNew ---
 #[unsafe(no_mangle)]
 pub static mut d_skill: skill_t = sk_medium;
 #[unsafe(no_mangle)]
@@ -1196,10 +1233,8 @@ demoplayback = 0;
 netdemo = 0;
 netgame = 0;
 deathmatch = 0;
-let in_game_ptr = (&raw mut playeringame) as *mut c_int;
-*in_game_ptr.add(1) = 0;
-*in_game_ptr.add(2) = 0;
-*in_game_ptr.add(3) = 0;
+let in_game = (&raw mut playeringame).as_mut().unwrap();
+in_game[1..].fill(0);
 respawnparm = 0;
 fastparm = 0;
 nomonsters = 0;
@@ -1221,11 +1256,11 @@ skill = sk_nightmare;
 if episode < 1 {
 episode = 1;
 }
-if gamemode == retail {
+if get_gamemode() == retail {
 if episode > 4 {
 episode = 4;
 }
-} else if gamemode == shareware {
+} else if get_gamemode() == shareware {
 if episode > 1 {
 episode = 1;
 }
@@ -1235,31 +1270,31 @@ episode = 3;
 if map < 1 {
 map = 1;
 }
-if map > 9 && gamemode != commercial {
+if map > 9 && get_gamemode() != commercial {
 map = 9;
 }
 m_clear_random();
 respawnmonsters = (skill == sk_nightmare || respawnparm != 0) as c_int;
-let states_base = (&raw mut states) as *mut state_t;
-let info_base = (&raw mut mobjinfo) as *mut mobjinfo_t;
+let states_arr = (&raw mut states).as_mut().unwrap();
+let info_arr = (&raw mut mobjinfo).as_mut().unwrap();
 if fastparm != 0 || (skill == sk_nightmare && gameskill != sk_nightmare) {
-for i in (S_SARG_RUN1 as usize)..=(S_SARG_PAIN2 as usize) {
-(*states_base.add(i)).tics >>= 1;
+for st in &mut states_arr[(S_SARG_RUN1 as usize)..=(S_SARG_PAIN2 as usize)] {
+st.tics >>= 1;
 }
-(*info_base.add(MT_BRUISERSHOT as usize)).speed = 20 * FRAC_UNIT;
-(*info_base.add(MT_HEADSHOT as usize)).speed = 20 * FRAC_UNIT;
-(*info_base.add(MT_TROOPSHOT as usize)).speed = 20 * FRAC_UNIT;
+info_arr[MT_BRUISERSHOT as usize].speed = 20 * FRAC_UNIT;
+info_arr[MT_HEADSHOT as usize].speed = 20 * FRAC_UNIT;
+info_arr[MT_TROOPSHOT as usize].speed = 20 * FRAC_UNIT;
 } else if skill != sk_nightmare && gameskill == sk_nightmare {
-for i in (S_SARG_RUN1 as usize)..=(S_SARG_PAIN2 as usize) {
-(*states_base.add(i)).tics <<= 1;
+for st in &mut states_arr[(S_SARG_RUN1 as usize)..=(S_SARG_PAIN2 as usize)] {
+st.tics <<= 1;
 }
-(*info_base.add(MT_BRUISERSHOT as usize)).speed = 15 * FRAC_UNIT;
-(*info_base.add(MT_HEADSHOT as usize)).speed = 10 * FRAC_UNIT;
-(*info_base.add(MT_TROOPSHOT as usize)).speed = 10 * FRAC_UNIT;
+info_arr[MT_BRUISERSHOT as usize].speed = 15 * FRAC_UNIT;
+info_arr[MT_HEADSHOT as usize].speed = 10 * FRAC_UNIT;
+info_arr[MT_TROOPSHOT as usize].speed = 10 * FRAC_UNIT;
 }
-let players_base = (&raw mut players) as *mut player_t;
-for i in 0..NUM_PLAYERS {
-(*players_base.add(i)).playerstate = (PST_REBORN as c_int);
+let players_arr = (&raw mut players).as_mut().unwrap();
+for p in players_arr.iter_mut() {
+p.playerstate = PST_REBORN as c_int;
 }
 usergame = 1;
 paused = 0;
@@ -1269,12 +1304,12 @@ viewactive = 1;
 gameepisode = episode;
 gamemap = map;
 gameskill = skill;
-if gamemode == commercial {
-skytexture = R_TextureNumForName(b"SKY3\0".as_ptr() as *mut c_char);
+if get_gamemode() == commercial {
+set_sky_texture(R_TextureNumForName(b"SKY3\0".as_ptr() as *mut c_char));
 if gamemap < 12 {
-skytexture = R_TextureNumForName(b"SKY1\0".as_ptr() as *mut c_char);
+set_sky_texture(R_TextureNumForName(b"SKY1\0".as_ptr() as *mut c_char));
 } else if gamemap < 21 {
-skytexture = R_TextureNumForName(b"SKY2\0".as_ptr() as *mut c_char);
+set_sky_texture(R_TextureNumForName(b"SKY2\0".as_ptr() as *mut c_char));
 }
 } else {
 let sky_lump = match episode {
@@ -1284,43 +1319,43 @@ let sky_lump = match episode {
 4 => b"SKY4\0".as_ptr(),
 _ => b"SKY1\0".as_ptr(),
 };
-skytexture = R_TextureNumForName(sky_lump as *mut c_char);
+set_sky_texture(R_TextureNumForName(sky_lump as *mut c_char));
 }
 G_DoLoadLevel();
 }
 }
-// --- Demo Recording & Playback ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn G_ReadDemoTiccmd(cmd: *mut ticcmd_t) {
+let Some(c) = (unsafe { cmd.as_mut() }) else { return };
 unsafe {
 if *demo_p == DEMOMARKER {
 G_CheckDemoStatus();
 return;
 }
-(*cmd).forwardmove = (*demo_p) as i8;
+c.forwardmove = (*demo_p) as i8;
 demo_p = demo_p.add(1);
-(*cmd).sidemove = (*demo_p) as i8;
+c.sidemove = (*demo_p) as i8;
 demo_p = demo_p.add(1);
-(*cmd).angleturn = ((*demo_p) as c_short) << 8;
+c.angleturn = ((*demo_p) as c_short) << 8;
 demo_p = demo_p.add(1);
-(*cmd).buttons = *demo_p;
+c.buttons = *demo_p;
 demo_p = demo_p.add(1);
 }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn G_WriteDemoTiccmd(cmd: *mut ticcmd_t) {
+let Some(c) = (unsafe { cmd.as_ref() }) else { return };
 unsafe {
-let kd = (&raw const gamekeydown) as *const c_int;
-if *kd.add(b'q' as usize) != 0 {
+if (&raw const gamekeydown).as_ref().unwrap()[b'q' as usize] != 0 {
 G_CheckDemoStatus();
 }
-*demo_p = (*cmd).forwardmove as u8;
+*demo_p = c.forwardmove as u8;
 demo_p = demo_p.add(1);
-*demo_p = (*cmd).sidemove as u8;
+*demo_p = c.sidemove as u8;
 demo_p = demo_p.add(1);
-*demo_p = (((*cmd).angleturn + 128) >> 8) as u8;
+*demo_p = ((c.angleturn + 128) >> 8) as u8;
 demo_p = demo_p.add(1);
-*demo_p = (*cmd).buttons;
+*demo_p = c.buttons;
 demo_p = demo_p.add(1);
 demo_p = demo_p.sub(4);
 if demo_p > demoend.sub(16) {
@@ -1332,19 +1367,25 @@ G_ReadDemoTiccmd(cmd);
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn G_RecordDemo(name: *mut c_char) {
+if name.is_null() {
+return;
+}
+let src = unsafe { CStr::from_ptr(name).to_str().unwrap_or("demo") };
+let full = format!("{}.lmp\0", src);
 unsafe {
 usergame = 0;
-let src = CStr::from_ptr(name).to_str().unwrap_or("demo");
-let full = format!("{}.lmp\0", src);
-let dst = (&raw mut demoname) as *mut c_char;
-let len = full.len().min(32);
-ptr::copy_nonoverlapping(full.as_ptr() as *const c_char, dst, len);
+let dst = (&raw mut demoname).as_mut().unwrap();
+dst.fill(0);
+for (d, &b) in dst.iter_mut().zip(full.as_bytes()).take(31) {
+*d = b as c_char;
+}
 let mut maxsize: c_int = 0x20000;
 let i = m_check_parm("-maxdemo");
-if i != 0 && i < myargc - 1 {
-let arg_ptr = *myargv.offset((i + 1) as isize);
-let s = CStr::from_ptr(arg_ptr).to_str().unwrap_or("128");
-maxsize = s.parse::<c_int>().unwrap_or(128) * 1024;
+if i != 0 && (i as usize) + 1 < args_len() {
+maxsize = get_arg((i + 1) as usize)
+.and_then(|s| s.parse::<c_int>().ok())
+.unwrap_or(128)
+* 1024;
 }
 demobuffer = Z_Malloc(maxsize, PU_STATIC, ptr::null_mut()) as *mut u8;
 demoend = demobuffer.add(maxsize as usize);
@@ -1373,9 +1414,9 @@ demo_p = demo_p.add(1);
 demo_p = demo_p.add(1);
 *demo_p = consoleplayer as u8;
 demo_p = demo_p.add(1);
-let in_game_ptr = (&raw const playeringame) as *const c_int;
-for i in 0..NUM_PLAYERS {
-*demo_p = (*in_game_ptr.add(i)) as u8;
+let in_game = (&raw const playeringame).as_ref().unwrap();
+for &ig in in_game {
+*demo_p = ig as u8;
 demo_p = demo_p.add(1);
 }
 }
@@ -1418,12 +1459,12 @@ nomonsters = (*demo_p) as c_int;
 demo_p = demo_p.add(1);
 consoleplayer = (*demo_p) as c_int;
 demo_p = demo_p.add(1);
-let in_game_ptr = (&raw mut playeringame) as *mut c_int;
-for i in 0..NUM_PLAYERS {
-*in_game_ptr.add(i) = (*demo_p) as c_int;
+let in_game = (&raw mut playeringame).as_mut().unwrap();
+for slot in in_game.iter_mut() {
+*slot = (*demo_p) as c_int;
 demo_p = demo_p.add(1);
 }
-if *in_game_ptr.add(1) != 0 {
+if in_game[1] != 0 {
 netgame = 1;
 netdemo = 1;
 }
@@ -1465,10 +1506,7 @@ demoplayback = 0;
 netdemo = 0;
 netgame = 0;
 deathmatch = 0;
-let in_game_ptr = (&raw mut playeringame) as *mut c_int;
-*in_game_ptr.add(1) = 0;
-*in_game_ptr.add(2) = 0;
-*in_game_ptr.add(3) = 0;
+(&raw mut playeringame).as_mut().unwrap()[1..].fill(0);
 respawnparm = 0;
 fastparm = 0;
 nomonsters = 0;

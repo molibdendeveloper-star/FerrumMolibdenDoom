@@ -6,8 +6,7 @@ use crate::r_things::player_s;
 
 const NUM_WEAPONS: usize = NUMWEAPONS as usize;
 
-#[unsafe(no_mangle)]
-pub static mut weaponinfo: [weaponinfo_t; NUM_WEAPONS] = [
+pub static weaponinfo: [weaponinfo_t; NUM_WEAPONS] = [
     // 0: fist
     weaponinfo_t {
         ammo: am_noammo,

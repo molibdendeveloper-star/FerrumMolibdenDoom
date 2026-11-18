@@ -1,16 +1,18 @@
-#![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, static_mut_refs)]
+#![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code)]
 
 pub use crate::bindings::*;
+use crate::doomstat::get_gamemode;
 use crate::r_segs::line_s;
 use crate::r_things::player_s;
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::ptr;
+use std::sync::{Mutex, OnceLock};
 
 use crate::r_data::R_CheckTextureNumForName;
 
-
 pub type bwhere_e = u32;
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct button_t {
@@ -20,6 +22,21 @@ pub struct button_t {
     pub btimer: c_int,
     pub soundorg: *mut mobj_t,
 }
+
+impl button_t {
+    pub const fn empty() -> Self {
+        Self {
+            line: ptr::null_mut(),
+            where_: 0,
+            btexture: 0,
+            btimer: 0,
+            soundorg: ptr::null_mut(),
+        }
+    }
+}
+
+unsafe impl Send for button_t {}
+
 const BWHERE_TOP: u32 = 0;
 const BWHERE_MIDDLE: u32 = 1;
 const BWHERE_BOTTOM: u32 = 2;
@@ -59,8 +76,6 @@ unsafe extern "C" {
 
     fn G_ExitLevel();
     fn G_SecretExitLevel();
-
-    static mut gamemode: GameMode_t;
     static mut sides: *mut side_t;
 }
 
@@ -72,10 +87,7 @@ fn doom_error(msg: &str) -> ! {
     unreachable!("I_Error should never return");
 }
 
-// --- Глобальные переменные p_switch.c ---
-#[unsafe(no_mangle)]
-pub static mut alphSwitchList: [switchlist_t; 41] = [
-    // Doom shareware episode 1 switches
+pub static ALPH_SWITCH_LIST: [switchlist_t; 41] = [
     make_sw(b"SW1BRCOM\0", b"SW2BRCOM\0", 1),
     make_sw(b"SW1BRN1\0\0", b"SW2BRN1\0\0", 1),
     make_sw(b"SW1BRN2\0\0", b"SW2BRN2\0\0", 1),
@@ -95,7 +107,6 @@ pub static mut alphSwitchList: [switchlist_t; 41] = [
     make_sw(b"SW1STON2\0", b"SW2STON2\0", 1),
     make_sw(b"SW1STONE\0", b"SW2STONE\0", 1),
     make_sw(b"SW1STRTN\0", b"SW2STRTN\0", 1),
-    // Doom registered episodes 2&3 switches
     make_sw(b"SW1BLUE\0\0", b"SW2BLUE\0\0", 2),
     make_sw(b"SW1CMT\0\0\0", b"SW2CMT\0\0\0", 2),
     make_sw(b"SW1GARG\0\0", b"SW2GARG\0\0", 2),
@@ -106,7 +117,6 @@ pub static mut alphSwitchList: [switchlist_t; 41] = [
     make_sw(b"SW1SKIN\0\0", b"SW2SKIN\0\0", 2),
     make_sw(b"SW1VINE\0\0", b"SW2VINE\0\0", 2),
     make_sw(b"SW1WOOD\0\0", b"SW2WOOD\0\0", 2),
-    // Doom II switches
     make_sw(b"SW1PANEL\0", b"SW2PANEL\0", 3),
     make_sw(b"SW1ROCK\0\0", b"SW2ROCK\0\0", 3),
     make_sw(b"SW1MET2\0\0", b"SW2MET2\0\0", 3),
@@ -118,57 +128,95 @@ pub static mut alphSwitchList: [switchlist_t; 41] = [
     make_sw(b"SW1TEK\0\0\0", b"SW2TEK\0\0\0", 3),
     make_sw(b"SW1MARB\0\0", b"SW2MARB\0\0", 3),
     make_sw(b"SW1SKULL\0", b"SW2SKULL\0", 3),
-    // Терминатор списка
     make_sw(b"\0\0\0\0\0\0\0\0\0", b"\0\0\0\0\0\0\0\0\0", 0),
 ];
 
-#[unsafe(no_mangle)]
-pub static mut switchlist: [c_int; NUM_SWITCHES * 2] = [0; NUM_SWITCHES * 2];
+struct SwitchState {
+    switchlist: [c_int; NUM_SWITCHES * 2],
+    numswitches: usize,
+    buttonlist: [button_t; NUM_BUTTONS],
+}
 
-#[unsafe(no_mangle)]
-pub static mut numswitches: c_int = 0;
-
-#[unsafe(no_mangle)]
-pub static mut buttonlist: [button_t; NUM_BUTTONS] = [unsafe { std::mem::zeroed() }; NUM_BUTTONS];
-
-// --- P_InitSwitchList ---
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn P_InitSwitchList() {
-    unsafe {
-        let mut episode: i16 = 1;
-        if gamemode == registered || gamemode == retail {
-            episode = 2;
-        } else if gamemode == commercial {
-            episode = 3;
+impl SwitchState {
+    const fn new() -> Self {
+        Self {
+            switchlist: [0; NUM_SWITCHES * 2],
+            numswitches: 0,
+            buttonlist: [button_t::empty(); NUM_BUTTONS],
         }
+    }
+}
 
-        let alph_ptr = (&raw const alphSwitchList) as *const switchlist_t;
-        let sw_ptr = (&raw mut switchlist) as *mut c_int;
-        let mut index = 0usize;
+static SWITCH_STATE: OnceLock<Mutex<SwitchState>> = OnceLock::new();
 
-        for i in 0..NUM_SWITCHES {
-            let entry = &*alph_ptr.add(i);
-            if entry.episode == 0 {
-                numswitches = (index / 2) as c_int;
-                *sw_ptr.add(index) = -1;
-                break;
-            }
+fn state() -> &'static Mutex<SwitchState> {
+    SWITCH_STATE.get_or_init(|| Mutex::new(SwitchState::new()))
+}
 
-            if entry.episode <= episode {
-                let tex1 = R_CheckTextureNumForName(entry.name1.as_ptr() as *mut c_char);
-                let tex2 = R_CheckTextureNumForName(entry.name2.as_ptr() as *mut c_char);
-                if tex1 != -1 && tex2 != -1 {
-                    *sw_ptr.add(index) = tex1;
-                    index += 1;
-                    *sw_ptr.add(index) = tex2;
-                    index += 1;
+pub fn clear_buttons() {
+    if let Ok(mut st) = state().lock() {
+        st.buttonlist.fill(button_t::empty());
+    }
+}
+
+pub fn update_buttons() {
+    let Ok(mut st) = state().lock() else { return };
+    for btn in &mut st.buttonlist {
+        if btn.btimer != 0 {
+            btn.btimer -= 1;
+            if btn.btimer == 0 {
+                unsafe {
+                    if !btn.line.is_null() && !sides.is_null() {
+                        let s0 = (*btn.line).sidenum[0] as usize;
+                        let side = &mut *sides.add(s0);
+                        let tex = btn.btexture as i16;
+                        match btn.where_ {
+                            BWHERE_TOP => side.toptexture = tex,
+                            BWHERE_MIDDLE => side.midtexture = tex,
+                            BWHERE_BOTTOM => side.bottomtexture = tex,
+                            _ => {}
+                        }
+                    }
+                    S_StartSound((&raw mut btn.soundorg) as *mut c_void, sfx_swtchn as c_int);
                 }
+                *btn = button_t::empty();
             }
         }
     }
 }
 
-// --- P_StartButton ---
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn P_InitSwitchList() {
+    let mut episode: i16 = 1;
+    if get_gamemode() == registered || get_gamemode() == retail {
+        episode = 2;
+    } else if get_gamemode() == commercial {
+        episode = 3;
+    }
+
+    let mut st = state().lock().unwrap();
+    let mut index = 0usize;
+
+    for entry in &ALPH_SWITCH_LIST {
+        if entry.episode == 0 {
+            st.numswitches = index / 2;
+            st.switchlist[index] = -1;
+            break;
+        }
+
+        if entry.episode <= episode {
+            let tex1 = unsafe { R_CheckTextureNumForName(entry.name1.as_ptr() as *mut c_char) };
+            let tex2 = unsafe { R_CheckTextureNumForName(entry.name2.as_ptr() as *mut c_char) };
+            if tex1 != -1 && tex2 != -1 {
+                st.switchlist[index] = tex1;
+                index += 1;
+                st.switchlist[index] = tex2;
+                index += 1;
+            }
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn P_StartButton(
     line: *mut line_t,
@@ -176,34 +224,28 @@ pub unsafe extern "C" fn P_StartButton(
     texture: c_int,
     time: c_int,
 ) {
-    unsafe {
-        let btn_ptr = (&raw mut buttonlist) as *mut button_t;
+    let mut st = state().lock().unwrap();
 
-        for i in 0..NUM_BUTTONS {
-            let btn = btn_ptr.add(i);
-            if (*btn).btimer != 0 && (*btn).line == line {
-                return;
-            }
+    for btn in &st.buttonlist {
+        if btn.btimer != 0 && btn.line == line {
+            return;
         }
-
-        for i in 0..NUM_BUTTONS {
-            let btn = btn_ptr.add(i);
-            if (*btn).btimer == 0 {
-                (*btn).line = line;
-                (*btn).where_ = w;
-                (*btn).btexture = texture;
-                (*btn).btimer = time;
-                let fsec = (*line).frontsector;
-                (*btn).soundorg = (&raw mut (*fsec).soundorg) as *mut mobj_t;
-                return;
-            }
-        }
-
-        doom_error("P_StartButton: no button slots left!");
     }
+
+    for btn in &mut st.buttonlist {
+        if btn.btimer == 0 {
+            btn.line = line;
+            btn.where_ = w;
+            btn.btexture = texture;
+            btn.btimer = time;
+            btn.soundorg = unsafe { (&raw mut (*(*line).frontsector).soundorg) as *mut mobj_t };
+            return;
+        }
+    }
+
+    doom_error("P_StartButton: no button slots left!");
 }
 
-// --- P_ChangeSwitchTexture ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn P_ChangeSwitchTexture(line: *mut line_t, use_again: c_int) {
     unsafe {
@@ -211,12 +253,12 @@ pub unsafe extern "C" fn P_ChangeSwitchTexture(line: *mut line_t, use_again: c_i
             (*line).special = 0;
         }
 
-        let side0 = *(*line).sidenum.as_ptr() as usize;
-        let side_ptr = sides.add(side0);
+        let side0 = (*line).sidenum[0] as usize;
+        let side = &mut *sides.add(side0);
 
-        let tex_top = (*side_ptr).toptexture as c_int;
-        let tex_mid = (*side_ptr).midtexture as c_int;
-        let tex_bot = (*side_ptr).bottomtexture as c_int;
+        let tex_top = side.toptexture as c_int;
+        let tex_mid = side.midtexture as c_int;
+        let tex_bot = side.bottomtexture as c_int;
 
         let sound = if (*line).special == 11 {
             sfx_swtchx as c_int
@@ -224,41 +266,43 @@ pub unsafe extern "C" fn P_ChangeSwitchTexture(line: *mut line_t, use_again: c_i
             sfx_swtchn as c_int
         };
 
-        let sw_ptr = (&raw const switchlist) as *const c_int;
-        let btn_ptr = (&raw const buttonlist) as *const button_t;
         let btime = BUTTONTIME as c_int;
+        let matched = {
+            let st = state().lock().unwrap();
+            let sound_org = st.buttonlist[0].soundorg as *mut c_void;
+            let mut found = None;
+            for i in 0..(st.numswitches * 2) {
+                let sw_tex = st.switchlist[i];
+                let opp_tex = st.switchlist[i ^ 1] as i16;
+                if sw_tex == tex_top {
+                    found = Some((BWHERE_TOP, sw_tex, opp_tex, sound_org));
+                    break;
+                } else if sw_tex == tex_mid {
+                    found = Some((BWHERE_MIDDLE, sw_tex, opp_tex, sound_org));
+                    break;
+                } else if sw_tex == tex_bot {
+                    found = Some((BWHERE_BOTTOM, sw_tex, opp_tex, sound_org));
+                    break;
+                }
+            }
+            found
+        };
 
-        for i in 0..((numswitches * 2) as usize) {
-            let sw_tex = *sw_ptr.add(i);
-            let opp_tex = *sw_ptr.add(i ^ 1) as i16;
-
-            if sw_tex == tex_top {
-                S_StartSound((*btn_ptr).soundorg as *mut c_void, sound);
-                (*side_ptr).toptexture = opp_tex;
-                if use_again != 0 {
-                    P_StartButton(line, BWHERE_TOP, sw_tex, btime);
-                }
-                return;
-            } else if sw_tex == tex_mid {
-                S_StartSound((*btn_ptr).soundorg as *mut c_void, sound);
-                (*side_ptr).midtexture = opp_tex;
-                if use_again != 0 {
-                    P_StartButton(line, BWHERE_MIDDLE, sw_tex, btime);
-                }
-                return;
-            } else if sw_tex == tex_bot {
-                S_StartSound((*btn_ptr).soundorg as *mut c_void, sound);
-                (*side_ptr).bottomtexture = opp_tex;
-                if use_again != 0 {
-                    P_StartButton(line, BWHERE_BOTTOM, sw_tex, btime);
-                }
-                return;
+        if let Some((where_, sw_tex, opp_tex, sound_org)) = matched {
+            S_StartSound(sound_org, sound);
+            match where_ {
+                BWHERE_TOP => side.toptexture = opp_tex,
+                BWHERE_MIDDLE => side.midtexture = opp_tex,
+                BWHERE_BOTTOM => side.bottomtexture = opp_tex,
+                _ => {}
+            }
+            if use_again != 0 {
+                P_StartButton(line, where_, sw_tex, btime);
             }
         }
     }
 }
 
-// --- P_UseSpecialLine ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn P_UseSpecialLine(
     thing: *mut mobj_t,
@@ -272,51 +316,45 @@ pub unsafe extern "C" fn P_UseSpecialLine(
                 _ => return 0,
             }
         }
-
-        if (*thing).player.is_null() {
-            if ((*line).flags as u32 & ML_SECRET) != 0 {
-                return 0;
-            }
-
-            match (*line).special {
-                1 | 32 | 33 | 34 => {}
-                _ => return 0,
-            }
-        }
-
-        match (*line).special {
-            // MANUALS
-            1 | 26 | 27 | 28 | 31 | 32 | 33 | 34 | 117 | 118 => {
-                EV_VerticalDoor(line, thing);
-            }
-
-            // SWITCHES
-            7 => {
-                if EV_BuildStairs(line, build8) != 0 {
-                    P_ChangeSwitchTexture(line, 0);
-                }
-            }
-            9 => {
-                if EV_DoDonut(line) != 0 {
-                    P_ChangeSwitchTexture(line, 0);
-                }
-            }
-            11 => {
-                P_ChangeSwitchTexture(line, 0);
-                G_ExitLevel();
-            }
-            14 => {
-                if EV_DoPlat(line, raiseAndChange, 32) != 0 {
-                    P_ChangeSwitchTexture(line, 0);
-                }
-            }
-            15 => {
-                if EV_DoPlat(line, raiseAndChange, 24) != 0 {
-                    P_ChangeSwitchTexture(line, 0);
-                }
-            }
-            18 => {
-                if EV_DoFloor(line, raiseFloorToNearest) != 0 {
+if (*thing).player.is_null() {
+if ((*line).flags as u32 & ML_SECRET) != 0 {
+return 0;
+}
+match (*line).special {
+1 | 32 | 33 | 34 => {}
+_ => return 0,
+}
+}
+match (*line).special {
+1 | 26 | 27 | 28 | 31 | 32 | 33 | 34 | 117 | 118 => {
+EV_VerticalDoor(line, thing);
+}
+7 => {
+if EV_BuildStairs(line, build8) != 0 {
+P_ChangeSwitchTexture(line, 0);
+}
+}
+9 => {
+if EV_DoDonut(line) != 0 {
+P_ChangeSwitchTexture(line, 0);
+}
+}
+11 => {
+P_ChangeSwitchTexture(line, 0);
+G_ExitLevel();
+}
+14 => {
+if EV_DoPlat(line, raiseAndChange, 32) != 0 {
+P_ChangeSwitchTexture(line, 0);
+}
+}
+15 => {
+if EV_DoPlat(line, raiseAndChange, 24) != 0 {
+P_ChangeSwitchTexture(line, 0);
+}
+}
+18 => {
+if EV_DoFloor(line, raiseFloorToNearest) != 0 {
 P_ChangeSwitchTexture(line, 0);
 }
 }
@@ -424,7 +462,6 @@ if EV_DoFloor(line, raiseFloor512) != 0 {
 P_ChangeSwitchTexture(line, 0);
 }
 }
-// BUTTONS
 42 => {
 if EV_DoDoor(line, close) != 0 {
 P_ChangeSwitchTexture(line, 1);

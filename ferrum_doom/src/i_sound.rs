@@ -1,71 +1,27 @@
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, static_mut_refs)]
 
 pub use crate::bindings::*;
-use crate::r_segs::line_s;
-use crate::r_things::player_s;
 
-use std::ffi::{CStr, c_char, c_int, c_void};
+use std::cell::RefCell;
+use std::ffi::{c_char, c_int, c_void};
 use std::fs::File;
 use std::io::Cursor;
-use std::ptr;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rustysynth::{MidiFile, MidiFileSequencer, SoundFont, Synthesizer, SynthesizerSettings};
+use sdl3::audio::{AudioCallback, AudioFormat, AudioSpec, AudioStreamWithCallback};
 
 use crate::g_game::gametic;
 use crate::mus2mid::convert_mus_to_mid;
 use crate::s_sound::{snd_MusicVolume, snd_SfxVolume};
-use crate::sounds::{S_sfx, sfxinfo_t};
-use crate::w_wad::{W_CacheLumpNum, W_CheckNumForName, W_GetNumForName, W_LumpLength};
+use crate::sounds::S_SFX;
+use crate::w_wad::{W_CacheLumpNum, W_LumpLength, w_check_num_for_name, w_get_num_for_name};
 use crate::z_zone::{PU_STATIC, Z_Free};
 
 const NUM_CHANNELS: usize = 8;
 const SAMPLERATE: i32 = 44100;
 const NUM_SFX: usize = NUMSFX as usize;
 
-const SDL_AUDIO_S16: u32 = 0x8010;
-const SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK: u32 = 0xFFFF_FFFF;
-
-#[repr(C)]
-pub struct SDL_AudioStream {
-    _private: [u8; 0],
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct SDL_AudioSpec {
-    pub format: u32,
-    pub channels: c_int,
-    pub freq: c_int,
-}
-
-type SDL_AudioStreamCallback = unsafe extern "C" fn(
-    userdata: *mut c_void,
-    stream: *mut SDL_AudioStream,
-    additional_amount: c_int,
-    total_amount: c_int,
-);
-
-unsafe extern "C" {
-    fn SDL_InitSubSystem(flags: u32) -> bool;
-    fn SDL_GetError() -> *const c_char;
-    fn SDL_OpenAudioDeviceStream(
-        devid: u32,
-        spec: *const SDL_AudioSpec,
-        callback: Option<SDL_AudioStreamCallback>,
-        userdata: *mut c_void,
-    ) -> *mut SDL_AudioStream;
-    fn SDL_SetAudioStreamGetCallback(
-        stream: *mut SDL_AudioStream,
-        callback: Option<SDL_AudioStreamCallback>,
-        userdata: *mut c_void,
-    ) -> bool;
-    fn SDL_ResumeAudioStreamDevice(stream: *mut SDL_AudioStream) -> bool;
-    fn SDL_PutAudioStreamData(stream: *mut SDL_AudioStream, buf: *const c_void, len: c_int) -> bool;
-    fn SDL_DestroyAudioStream(stream: *mut SDL_AudioStream);
-}
-
-#[unsafe(no_mangle)]
 pub static mut sndserver_filename: *mut c_char = b"sndserver\0".as_ptr() as *mut c_char;
 
 #[derive(Clone, Default)]
@@ -101,7 +57,6 @@ struct AudioEngine {
 
     mus_left: Vec<f32>,
     mus_right: Vec<f32>,
-    mix_buf: Vec<i16>,
 }
 
 impl AudioEngine {
@@ -125,23 +80,27 @@ impl AudioEngine {
             music_volume: 0.5,
             mus_left: Vec::with_capacity(4096),
             mus_right: Vec::with_capacity(4096),
-            mix_buf: Vec::with_capacity(8192),
         }
     }
 
-    fn mix_frame(&mut self, sample_count: usize) {
-        self.mix_buf.resize(sample_count * 2, 0);
+    fn mix_into(&mut self, out: &mut [i16]) {
+        let sample_count = out.len() / 2;
+        if sample_count == 0 {
+            return;
+        }
+
         self.mus_left.resize(sample_count, 0.0);
         self.mus_right.resize(sample_count, 0.0);
         self.mus_left.fill(0.0);
         self.mus_right.fill(0.0);
 
         if self.music_playing {
+            let midi_opt = self.current_midi.clone();
             if let Some(seq) = self.sequencer.as_mut() {
                 seq.render(&mut self.mus_left, &mut self.mus_right);
                 if seq.end_of_sequence() {
                     if self.music_looping {
-                        if let Some(midi) = self.current_midi.as_ref() {
+                        if let Some(midi) = midi_opt.as_ref() {
                             seq.play(midi, true);
                         }
                     } else {
@@ -178,91 +137,94 @@ impl AudioEngine {
                 }
             }
 
-            self.mix_buf[frame * 2] = dl.clamp(-0x8000, 0x7fff) as i16;
-            self.mix_buf[frame * 2 + 1] = dr.clamp(-0x8000, 0x7fff) as i16;
+            out[frame * 2] = dl.clamp(-0x8000, 0x7fff) as i16;
+            out[frame * 2 + 1] = dr.clamp(-0x8000, 0x7fff) as i16;
         }
     }
 }
 
+struct DoomAudioCallback {
+    buf: Vec<i16>,
+}
+
+impl AudioCallback<i16> for DoomAudioCallback {
+    fn callback(&mut self, stream: &mut sdl3::audio::AudioStream, requested: i32) {
+        if requested <= 0 {
+            return;
+        }
+        let samples_i16 = requested as usize;
+        self.buf.resize(samples_i16, 0);
+
+        if let Ok(mut eng) = engine().lock() {
+            eng.mix_into(&mut self.buf);
+        } else {
+            self.buf.fill(0);
+        }
+
+        let _ = stream.put_data_i16(&self.buf);
+    }
+}
+
 static ENGINE: OnceLock<Mutex<AudioEngine>> = OnceLock::new();
-static mut AUDIO_STREAM: *mut SDL_AudioStream = ptr::null_mut();
+
+thread_local! {
+    static AUDIO_STREAM: RefCell<Option<AudioStreamWithCallback<DoomAudioCallback>>> = const { RefCell::new(None) };
+}
 
 fn engine() -> &'static Mutex<AudioEngine> {
     ENGINE.get_or_init(|| Mutex::new(AudioEngine::new()))
 }
 
-unsafe fn load_wad_sfx(sfxname: *const c_char) -> SfxSample {
-    unsafe {
-        if sfxname.is_null() {
-            return SfxSample::default();
-        }
-        let name_str = CStr::from_ptr(sfxname).to_string_lossy();
-        let full_name = format!("ds{}\0", name_str);
+fn load_wad_sfx(sfxname: Option<&str>) -> SfxSample {
+    let Some(name_str) = sfxname else {
+        return SfxSample::default();
+    };
+    let full_name = format!("ds{}", name_str);
 
-        let sfxlump = if W_CheckNumForName(full_name.as_ptr() as *mut c_char) == -1 {
-            W_GetNumForName(b"dspistol\0".as_ptr() as *mut c_char)
-        } else {
-            W_GetNumForName(full_name.as_ptr() as *mut c_char)
-        };
+    let sfxlump = if w_check_num_for_name(&full_name) == -1 {
+        w_get_num_for_name("dspistol")
+    } else {
+        w_get_num_for_name(&full_name)
+    };
 
-        let size = W_LumpLength(sfxlump) as usize;
-        if size <= 8 {
-            return SfxSample::default();
-        }
+    let size = W_LumpLength(sfxlump) as usize;
+    if size <= 8 {
+        return SfxSample::default();
+    }
 
-        let raw = W_CacheLumpNum(sfxlump, PU_STATIC) as *const u8;
-        let bytes = std::slice::from_raw_parts(raw, size);
+    let raw = W_CacheLumpNum(sfxlump, PU_STATIC) as *const u8;
+    let bytes = unsafe { std::slice::from_raw_parts(raw, size) };
 
-        let mut rate = u16::from_le_bytes([bytes[2], bytes[3]]) as u32;
-        if rate == 0 {
-            rate = 11025;
-        }
-        let declared_len = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
-        let pcm_len = declared_len.min(size - 8);
-        let data = bytes[8..(8 + pcm_len)].to_vec();
+    let mut rate = u16::from_le_bytes(bytes[2..4].try_into().unwrap()) as u32;
+    if rate == 0 {
+        rate = 11025;
+    }
+    let declared_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let pcm_len = declared_len.min(size - 8);
+    let data = bytes[8..(8 + pcm_len)].to_vec();
 
-        Z_Free(raw as *mut c_void);
-        SfxSample { data, sample_rate: rate }
+    Z_Free(raw as *mut c_void);
+    SfxSample {
+        data,
+        sample_rate: rate,
     }
 }
 
-unsafe extern "C" fn audio_stream_callback(
-    _userdata: *mut c_void,
-    stream: *mut SDL_AudioStream,
-    additional_amount: c_int,
-    _total_amount: c_int,
-) {
-    if additional_amount <= 0 {
-        return;
-    }
-    let samples = (additional_amount as usize) / 4;
-    if samples == 0 {
-        return;
-    }
-
-    let mut eng = engine().lock().unwrap();
-    eng.mix_frame(samples);
-    unsafe {
-        SDL_PutAudioStreamData(
-            stream,
-            eng.mix_buf.as_ptr() as *const c_void,
-            (samples * 4) as c_int,
-        );
-    }
+pub fn get_sfx_lump_num(name: Option<&str>) -> c_int {
+    let Some(name_str) = name else { return -1 };
+    let full_name = format!("ds{}", name_str);
+    w_get_num_for_name(&full_name)
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn I_SetChannels() {}
+pub extern "C" fn I_SetChannels() {}
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn I_SetSfxVolume(volume: c_int) {
+pub extern "C" fn I_SetSfxVolume(volume: c_int) {
     unsafe {
         snd_SfxVolume = volume;
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn I_SetMusicVolume(volume: c_int) {
+pub extern "C" fn I_SetMusicVolume(volume: c_int) {
     unsafe {
         snd_MusicVolume = volume;
     }
@@ -270,28 +232,17 @@ pub unsafe extern "C" fn I_SetMusicVolume(volume: c_int) {
     eng.music_volume = (volume as f32) / 15.0;
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn I_GetSfxLumpNum(sfx: *mut sfxinfo_t) -> c_int {
-    unsafe {
-        let name_str = CStr::from_ptr((*sfx).name).to_string_lossy();
-        let full_name = format!("ds{}\0", name_str);
-        W_GetNumForName(full_name.as_ptr() as *mut c_char)
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn I_StartSound(
+pub extern "C" fn I_StartSound(
     id: c_int,
     vol: c_int,
     sep: c_int,
     pitch: c_int,
     _priority: c_int,
 ) -> c_int {
-    unsafe {
-        if AUDIO_STREAM.is_null() {
-            return 0;
-        }
+    if AUDIO_STREAM.with(|s| s.borrow().is_none()) {
+        return 0;
     }
+
     let sfx_id = id as usize;
     if sfx_id == 0 || sfx_id >= NUM_SFX {
         return 0;
@@ -318,7 +269,8 @@ pub unsafe extern "C" fn I_StartSound(
     }
 
     let mut slot = 0usize;
-    let mut oldest = unsafe { gametic };
+    let cur_tic = unsafe { gametic };
+    let mut oldest = cur_tic;
     for (i, ch) in eng.channels.iter().enumerate() {
         if !ch.active {
             slot = i;
@@ -343,105 +295,107 @@ pub unsafe extern "C" fn I_StartSound(
     eng.next_handle = if eng.next_handle >= 30000 { 100 } else { eng.next_handle + 1 };
 
     eng.channels[slot] = Channel {
-active: true,
-sfx_id,
-pos_fp: 0,
-step_fp,
-handle,
-start_tic: unsafe { gametic },
-left_vol,
-right_vol,
-};
-handle
+        active: true,
+        sfx_id,
+        pos_fp: 0,
+        step_fp,
+        handle,
+        start_tic: cur_tic,
+        left_vol,
+        right_vol,
+    };
+
+    handle
 }
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn I_StopSound(handle: c_int) {
-let mut eng = engine().lock().unwrap();
-for ch in &mut eng.channels {
-if ch.active && ch.handle == handle {
-ch.active = false;
-break;
+
+pub extern "C" fn I_StopSound(handle: c_int) {
+    let mut eng = engine().lock().unwrap();
+    for ch in &mut eng.channels {
+        if ch.active && ch.handle == handle {
+            ch.active = false;
+            break;
+        }
+    }
 }
+
+pub extern "C" fn I_SoundIsPlaying(handle: c_int) -> c_int {
+    let eng = engine().lock().unwrap();
+    for ch in &eng.channels {
+        if ch.active && ch.handle == handle {
+            return 1;
+        }
+    }
+    0
 }
+
+pub extern "C" fn I_UpdateSoundParams(_handle: c_int, _vol: c_int, _sep: c_int, _pitch: c_int) {}
+
+pub extern "C" fn I_UpdateSound() {}
+
+pub extern "C" fn I_SubmitSound() {}
+
+pub extern "C" fn I_ShutdownSound() {
+    AUDIO_STREAM.with(|s| {
+        *s.borrow_mut() = None;
+    });
 }
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn I_SoundIsPlaying(handle: c_int) -> c_int {
-let eng = engine().lock().unwrap();
-for ch in &eng.channels {
-if ch.active && ch.handle == handle {
-return 1;
-}
-}
-0
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn I_UpdateSoundParams(_handle: c_int, _vol: c_int, _sep: c_int, _pitch: c_int) {}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn I_UpdateSound() {}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn I_SubmitSound() {}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn I_ShutdownSound() {
-unsafe {
-if !AUDIO_STREAM.is_null() {
-SDL_DestroyAudioStream(AUDIO_STREAM);
-AUDIO_STREAM = ptr::null_mut();
-}
-}
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn I_InitSound() {
-unsafe {
-if !SDL_InitSubSystem(SDL_INIT_AUDIO) {
-let err = CStr::from_ptr(SDL_GetError()).to_string_lossy();
-eprintln!("I_InitSound: SDL_InitSubSystem(AUDIO) failed: {}", err);
-return;
-}
-let spec = SDL_AudioSpec {
-format: SDL_AUDIO_S16,
-channels: 2,
-freq: SAMPLERATE,
-};
-AUDIO_STREAM = SDL_OpenAudioDeviceStream(
-SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
-&raw const spec,
-None,
-ptr::null_mut(),
-);
-if AUDIO_STREAM.is_null() {
-let err = CStr::from_ptr(SDL_GetError()).to_string_lossy();
-eprintln!("I_InitSound: SDL_OpenAudioDeviceStream failed: {}", err);
-return;
-}
-let mut eng = engine().lock().unwrap();
-let sfx_base = (&raw mut S_sfx) as *mut sfxinfo_t;
-for i in 1..NUM_SFX {
-let s = sfx_base.add(i);
-if (*s).link.is_null() {
-eng.sfx_bank[i] = load_wad_sfx((*s).name);
-(*s).data = if eng.sfx_bank[i].data.is_empty() {
-ptr::null_mut()
-} else {
-eng.sfx_bank[i].data.as_mut_ptr() as *mut c_void
-};
+
+pub extern "C" fn I_InitSound() {
+    let sdl = match sdl3::init() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("I_InitSound: sdl3::init failed: {e}");
+            return;
+        }
+    };
+    let audio_subsys = match sdl.audio() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("I_InitSound: SDL_InitSubSystem(AUDIO) failed: {e}");
+            return;
+        }
+    };
+
+    {
+        let mut eng = engine().lock().unwrap();
+        let sfx_table = S_SFX.lock().unwrap();
+        for i in 1..NUM_SFX {
+            if sfx_table[i].link_id.is_none() {
+                eng.sfx_bank[i] = load_wad_sfx(sfx_table[i].name);
 }
 }
 for i in 1..NUM_SFX {
-let s = sfx_base.add(i);
-if !(*s).link.is_null() {
-let link_idx = (*s).link.offset_from(sfx_base) as usize;
+if let Some(link_idx) = sfx_table[i].link_id {
 eng.sfx_bank[i] = eng.sfx_bank[link_idx].clone();
-(*s).data = (*sfx_base.add(link_idx)).data;
 }
 }
-drop(eng);
-SDL_SetAudioStreamGetCallback(AUDIO_STREAM, Some(audio_stream_callback), ptr::null_mut());
-SDL_ResumeAudioStreamDevice(AUDIO_STREAM);
-eprintln!("I_InitSound: 100% pure Rust SDL3 + rustySynth audio ready (44100Hz stereo)");
 }
+let spec = AudioSpec {
+freq: Some(SAMPLERATE),
+channels: Some(2),
+format: Some(AudioFormat::s16_sys()),
+};
+let Ok(device) = audio_subsys.open_playback_device(&spec) else {
+eprintln!("I_InitSound: open_playback_device failed");
+return;
+};
+let stream = match device.open_playback_stream_with_callback(
+&spec,
+DoomAudioCallback {
+buf: Vec::with_capacity(4096),
+},
+) {
+Ok(st) => st,
+Err(e) => {
+eprintln!("I_InitSound: open_playback_stream_with_callback failed: {e}");
+return;
 }
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn I_InitMusic() {
+};
+let _ = stream.resume();
+AUDIO_STREAM.with(|s| *s.borrow_mut() = Some(stream));
+eprintln!("I_InitSound: safe sdl3::audio + rustySynth ready (44100Hz stereo)");
+}
+pub extern "C" fn I_InitMusic() {
 let sf_paths = [
 "soundfont.sf2",
 "/usr/share/soundfonts/FluidR3_GM.sf2",
@@ -465,8 +419,7 @@ return;
 }
 eprintln!("I_InitMusic: no SoundFont (.sf2) found, music disabled");
 }
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn I_ShutdownMusic() {
+pub extern "C" fn I_ShutdownMusic() {
 let mut eng = engine().lock().unwrap();
 eng.music_playing = false;
 if let Some(seq) = eng.sequencer.as_mut() {
@@ -474,38 +427,33 @@ seq.stop();
 }
 eng.current_midi = None;
 }
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn I_PlaySong(_handle: c_int, looping: c_int) {
+pub extern "C" fn I_PlaySong(_handle: c_int, looping: c_int) {
 let mut eng = engine().lock().unwrap();
 eng.music_looping = looping != 0;
-    let midi_opt = eng.current_midi.clone();
-    if let (Some(seq), Some(midi)) = (eng.sequencer.as_mut(), midi_opt.as_ref()) {
+let midi_opt = eng.current_midi.clone();
+if let (Some(seq), Some(midi)) = (eng.sequencer.as_mut(), midi_opt.as_ref()) {
 seq.play(midi, looping != 0);
 eng.music_playing = true;
 }
 }
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn I_PauseSong(_handle: c_int) {
+pub extern "C" fn I_PauseSong(_handle: c_int) {
 let mut eng = engine().lock().unwrap();
 eng.music_playing = false;
 }
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn I_ResumeSong(_handle: c_int) {
+pub extern "C" fn I_ResumeSong(_handle: c_int) {
 let mut eng = engine().lock().unwrap();
 if eng.current_midi.is_some() {
 eng.music_playing = true;
 }
 }
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn I_StopSong(_handle: c_int) {
+pub extern "C" fn I_StopSong(_handle: c_int) {
 let mut eng = engine().lock().unwrap();
 eng.music_playing = false;
 if let Some(seq) = eng.sequencer.as_mut() {
 seq.stop();
 }
 }
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn I_UnRegisterSong(_handle: c_int) {
+pub extern "C" fn I_UnRegisterSong(_handle: c_int) {
 let mut eng = engine().lock().unwrap();
 eng.music_playing = false;
 if let Some(seq) = eng.sequencer.as_mut() {
@@ -513,13 +461,11 @@ seq.stop();
 }
 eng.current_midi = None;
 }
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn I_RegisterSong(data: *mut c_void) -> c_int {
-unsafe { I_UnRegisterSong(1); }
+I_UnRegisterSong(1);
 if data.is_null() {
 return 0;
 }
-// Максимальный размер MUS-лампа в DOOM не превышает 64 КБ
 let mus_slice = unsafe { std::slice::from_raw_parts(data as *const u8, 65536) };
 let Some(mid_bytes) = convert_mus_to_mid(mus_slice) else {
 eprintln!("I_RegisterSong: failed to convert MUS to MIDI");
@@ -534,8 +480,7 @@ let mut eng = engine().lock().unwrap();
 eng.current_midi = Some(Arc::new(midi_file));
 1
 }
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn I_QrySongPlaying(_handle: c_int) -> c_int {
+pub extern "C" fn I_QrySongPlaying(_handle: c_int) -> c_int {
 let eng = engine().lock().unwrap();
 eng.music_playing as c_int
 }

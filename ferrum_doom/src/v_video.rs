@@ -1,21 +1,18 @@
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code)]
 
 pub use crate::bindings::*;
-use crate::r_segs::line_s;
-use crate::r_things::player_s;
 
-use std::ffi::{CString, c_char, c_int, c_short};
+use std::ffi::{CString, c_char, c_int};
 use std::ptr;
 
 use crate::m_bbox::m_add_to_box;
-use crate::m_swap::{swap_long, swap_short};
 
 const SCR_W: usize = SCREENWIDTH as usize;
 const SCR_H: usize = SCREENHEIGHT as usize;
+const SCR_SIZE: usize = SCR_W * SCR_H;
 
 unsafe extern "C" {
     fn I_Error(error: *const c_char, ...);
-    fn I_AllocLow(length: c_int) -> *mut u8;
 }
 
 pub fn doom_error(msg: &str) -> ! {
@@ -26,15 +23,12 @@ pub fn doom_error(msg: &str) -> ! {
     unreachable!("I_Error should never return");
 }
 
-
-
 #[repr(C)]
 pub struct column_t {
     pub topdelta: u8,
     pub length: u8,
 }
 
-// Глобальные переменные видеоподсистемы
 #[unsafe(no_mangle)]
 pub static mut screens: [*mut u8; 5] = [ptr::null_mut(); 5];
 
@@ -134,8 +128,15 @@ pub static gammatable: [[u8; 256]; 5] = [
     ]
 ];
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn V_MarkRect(x: c_int, y: c_int, width: c_int, height: c_int) {
+unsafe fn get_screen_slice(scrn: c_int) -> &'static mut [u8] {
+    unsafe {
+        let scr_ptr = (&raw const screens) as *const *mut u8;
+        let ptr = *scr_ptr.add(scrn as usize);
+        std::slice::from_raw_parts_mut(ptr, SCR_SIZE)
+    }
+}
+
+pub fn v_mark_rect(x: c_int, y: c_int, width: c_int, height: c_int) {
     unsafe {
         let box_arr = &mut *(&raw mut dirtybox);
         m_add_to_box(box_arr, x, y);
@@ -143,192 +144,165 @@ pub unsafe extern "C" fn V_MarkRect(x: c_int, y: c_int, width: c_int, height: c_
     }
 }
 
+fn copy_rect_safe(
+    srcx: usize,
+    srcy: usize,
+    src: &[u8],
+    width: usize,
+    height: usize,
+    destx: usize,
+    desty: usize,
+    dest: &mut [u8],
+) {
+    for row in 0..height {
+        let s_ofs = (srcy + row) * SCR_W + srcx;
+        let d_ofs = (desty + row) * SCR_W + destx;
+        dest[d_ofs..d_ofs + width].copy_from_slice(&src[s_ofs..s_ofs + width]);
+    }
+}
+
+fn draw_patch_safe(
+    mut x: c_int,
+    mut y: c_int,
+    scrn: c_int,
+    patch: &patch_t,
+    flipped: bool,
+) {
+    let w = patch.width as c_int;
+    let h = patch.height as c_int;
+    y -= patch.topoffset as c_int;
+    x -= patch.leftoffset as c_int;
+
+    if (scrn as u32) > 4 {
+        return;
+    }
+
+    let scr_w = SCREENWIDTH as c_int;
+    let scr_h = SCREENHEIGHT as c_int;
+
+    let mark_x = x.max(0);
+    let mark_y = y.max(0);
+    let mark_w = (x + w).min(scr_w) - mark_x;
+    let mark_h = (y + h).min(scr_h) - mark_y;
+    if mark_w <= 0 || mark_h <= 0 {
+        return;
+    }
+
+    if scrn == 0 {
+        v_mark_rect(mark_x, mark_y, mark_w, mark_h);
+    }
+
+    let dst = unsafe { get_screen_slice(scrn) };
+    let patch_base = (patch as *const patch_t) as *const u8;
+    let col_ofs = unsafe { std::slice::from_raw_parts(patch.columnofs.as_ptr(), w.max(0) as usize) };
+
+    let start_col = (-x).max(0);
+    let end_col = (scr_w - x).min(w);
+
+    for col in start_col..end_col {
+        let cur_x = (x + col) as usize;
+        let lookup_col = if flipped { w - 1 - col } else { col } as usize;
+        let mut ofs = col_ofs[lookup_col] as usize;
+
+        loop {
+            let topdelta = unsafe { *patch_base.add(ofs) };
+            if topdelta == 0xff {
+                break;
+            }
+            let length = unsafe { *patch_base.add(ofs + 1) } as c_int;
+            let src_col = unsafe { std::slice::from_raw_parts(patch_base.add(ofs + 3), length.max(0) as usize) };
+
+            let mut dest_y = y + (topdelta as c_int);
+            let mut count = length;
+            let mut src_skip = 0usize;
+
+            if dest_y < 0 {
+                let skip = -dest_y;
+                if skip >= count {
+                    ofs += (length as usize) + 4;
+                    continue;
+                }
+                src_skip = skip as usize;
+                count -= skip;
+                dest_y = 0;
+            }
+
+            if dest_y + count > scr_h {
+                count = scr_h - dest_y;
+            }
+
+            if count > 0 {
+                let dy = dest_y as usize;
+                let cnt = count as usize;
+                for row in 0..cnt {
+                    dst[(dy + row) * SCR_W + cur_x] = src_col[src_skip + row];
+                }
+            }
+
+            ofs += (length as usize) + 4;
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn V_MarkRect(x: c_int, y: c_int, width: c_int, height: c_int) {
+    v_mark_rect(x, y, width, height);
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn V_CopyRect(
     srcx: c_int,
     srcy: c_int,
-    srcscrn: c_int,
-    width: c_int,
-    mut height: c_int,
-    destx: c_int,
-    desty: c_int,
-    destscrn: c_int,
+srcscrn: c_int,
+width: c_int,
+height: c_int,
+destx: c_int,
+desty: c_int,
+destscrn: c_int,
 ) {
-    unsafe {
-        if srcx < 0
-            || srcx + width > SCREENWIDTH as c_int
-            || srcy < 0
-            || srcy + height > SCREENHEIGHT as c_int
-            || destx < 0
-            || destx + width > SCREENWIDTH as c_int
-            || desty < 0
-            || desty + height > SCREENHEIGHT as c_int
-            || (srcscrn as u32) > 4
-            || (destscrn as u32) > 4
-        {
-            doom_error("Bad V_CopyRect");
-        }
-
-        V_MarkRect(destx, desty, width, height);
-
-        let scr_ptr = &raw const screens as *const *mut u8;
-        let mut src = (*scr_ptr.add(srcscrn as usize)).add(SCR_W * (srcy as usize) + (srcx as usize));
-        let mut dest = (*scr_ptr.add(destscrn as usize)).add(SCR_W * (desty as usize) + (destx as usize));
-
-        while height > 0 {
-            ptr::copy_nonoverlapping(src, dest, width as usize);
-            src = src.add(SCR_W);
-            dest = dest.add(SCR_W);
-            height -= 1;
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn V_DrawPatch(
-    mut x: c_int,
-    mut y: c_int,
-    scrn: c_int,
-    patch: *mut patch_t,
-) {
-    if patch.is_null() {
-        return;
-    }
-
-    unsafe {
-        let w = (*patch).width as c_int;
-        let h = (*patch).height as c_int;
-        let left_off = (*patch).leftoffset as c_int;
-        let top_off = (*patch).topoffset as c_int;
-
-        y -= top_off;
-        x -= left_off;
-
-        if (scrn as u32) > 4 {
-            return;
-        }
-
-        let scr_w = SCREENWIDTH as c_int;
-        let scr_h = SCREENHEIGHT as c_int;
-
-        let mark_x = x.max(0);
-        let mark_y = y.max(0);
-        let mark_w = (x + w).min(scr_w) - mark_x;
-        let mark_h = (y + h).min(scr_h) - mark_y;
-        if mark_w <= 0 || mark_h <= 0 {
-            return;
-        }
-
-        if scrn == 0 {
-            V_MarkRect(mark_x, mark_y, mark_w, mark_h);
-        }
-
-        let scr_ptr = &raw const screens as *const *mut u8;
-        let scr_base = *scr_ptr.add(scrn as usize);
-        let col_ofs_ptr = &raw const (*patch).columnofs as *const c_int;
-
-        let start_col = (-x).max(0);
-        let end_col = (scr_w - x).min(w);
-
-        for col in start_col..end_col {
-            let cur_x = (x + col) as isize;
-            let ofs = (*col_ofs_ptr.add(col as usize)) as isize;
-            let mut column = (patch as *const u8).offset(ofs) as *const column_t;
-
-            while (*column).topdelta != 0xff {
-                let mut source = (column as *const u8).add(3);
-                let mut dest_y = y + ((*column).topdelta as c_int);
-                let mut count = (*column).length as c_int;
-
-                if dest_y < 0 {
-                    let skip = -dest_y;
-                    if skip >= count {
-                        column = (column as *const u8).add(((*column).length as usize) + 4) as *const column_t;
-                        continue;
-                    }
-                    source = source.add(skip as usize);
-                    count -= skip;
-                    dest_y = 0;
-                }
-
-                if dest_y + count > scr_h {
-                    count = scr_h - dest_y;
-                }
-
-                if count > 0 {
-                    let mut dest = scr_base.offset((dest_y as isize) * (SCR_W as isize) + cur_x);
-                    for _ in 0..count {
-                        *dest = *source;
-                        dest = dest.add(SCR_W);
-                        source = source.add(1);
-                    }
-                }
-
-                column = (column as *const u8).add(((*column).length as usize) + 4) as *const column_t;
-            }
-        }
-}
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn V_DrawPatchFlipped(
-mut x: c_int,
-mut y: c_int,
-scrn: c_int,
-patch: *mut patch_t,
-) {
-if patch.is_null() {
-return;
-}
-unsafe {
-let w = (*patch).width as c_int;
-let h = (*patch).height as c_int;
-let left_off = (*patch).leftoffset as c_int;
-let top_off = (*patch).topoffset as c_int;
-y -= top_off;
-x -= left_off;
-if x < 0
-|| x + w > SCREENWIDTH as c_int
-|| y < 0
-|| y + h > SCREENHEIGHT as c_int
-|| (scrn as u32) > 4
+if srcx < 0
+|| srcx + width > SCREENWIDTH as c_int
+|| srcy < 0
+|| srcy + height > SCREENHEIGHT as c_int
+|| destx < 0
+|| destx + width > SCREENWIDTH as c_int
+|| desty < 0
+|| desty + height > SCREENHEIGHT as c_int
+|| (srcscrn as u32) > 4
+|| (destscrn as u32) > 4
 {
-eprintln!("Patch origin {},{} exceeds LFB", x, y);
-doom_error("Bad V_DrawPatch in V_DrawPatchFlipped");
+doom_error("Bad V_CopyRect");
 }
-if scrn == 0 {
-V_MarkRect(x, y, w, h);
+v_mark_rect(destx, desty, width, height);
+let src = unsafe { get_screen_slice(srcscrn) };
+let dst = unsafe { get_screen_slice(destscrn) };
+copy_rect_safe(
+srcx as usize,
+srcy as usize,
+src,
+width as usize,
+height as usize,
+destx as usize,
+desty as usize,
+dst,
+);
 }
-let scr_ptr = &raw const screens as *const *mut u8;
-let mut desttop = (*scr_ptr.add(scrn as usize)).offset((y as isize) * (SCR_W as isize) + (x as isize));
-let col_ofs_ptr = &raw const (*patch).columnofs as *const c_int;
-for col in 0..w {
-let ofs = (*col_ofs_ptr.add((w - 1 - col) as usize)) as isize;
-let mut column = (patch as *const u8).offset(ofs) as *const column_t;
-while (*column).topdelta != 0xff {
-let mut source = (column as *const u8).add(3);
-let mut dest = desttop.add(((*column).topdelta as usize) * SCR_W);
-let mut count = (*column).length;
-while count > 0 {
-*dest = *source;
-source = source.add(1);
-dest = dest.add(SCR_W);
-count -= 1;
-}
-column = (column as *const u8).add(((*column).length as usize) + 4) as *const column_t;
-}
-desttop = desttop.add(1);
-}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn V_DrawPatch(x: c_int, y: c_int, scrn: c_int, patch: *mut patch_t) {
+if let Some(p) = unsafe { patch.as_ref() } {
+draw_patch_safe(x, y, scrn, p, false);
 }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn V_DrawPatchDirect(
-x: c_int,
-y: c_int,
-scrn: c_int,
-patch: *mut patch_t,
-) {
-unsafe {
-V_DrawPatch(x, y, scrn, patch);
+pub unsafe extern "C" fn V_DrawPatchFlipped(x: c_int, y: c_int, scrn: c_int, patch: *mut patch_t) {
+if let Some(p) = unsafe { patch.as_ref() } {
+draw_patch_safe(x, y, scrn, p, true);
+}
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn V_DrawPatchDirect(x: c_int, y: c_int, scrn: c_int, patch: *mut patch_t) {
+if let Some(p) = unsafe { patch.as_ref() } {
+draw_patch_safe(x, y, scrn, p, false);
 }
 }
 #[unsafe(no_mangle)]
@@ -337,27 +311,29 @@ x: c_int,
 y: c_int,
 scrn: c_int,
 width: c_int,
-mut height: c_int,
-mut src: *mut u8,
+height: c_int,
+src: *mut u8,
 ) {
-unsafe {
 if x < 0
 || x + width > SCREENWIDTH as c_int
 || y < 0
 || y + height > SCREENHEIGHT as c_int
 || (scrn as u32) > 4
+|| src.is_null()
 {
 doom_error("Bad V_DrawBlock");
 }
-V_MarkRect(x, y, width, height);
-let scr_ptr = &raw const screens as *const *mut u8;
-let mut dest = (*scr_ptr.add(scrn as usize)).add(SCR_W * (y as usize) + (x as usize));
-while height > 0 {
-ptr::copy_nonoverlapping(src, dest, width as usize);
-src = src.add(width as usize);
-dest = dest.add(SCR_W);
-height -= 1;
-}
+v_mark_rect(x, y, width, height);
+let w = width as usize;
+let h = height as usize;
+let ux = x as usize;
+let uy = y as usize;
+let src_slice = unsafe { std::slice::from_raw_parts(src, w * h) };
+let dst = unsafe { get_screen_slice(scrn) };
+for row in 0..h {
+let s_ofs = row * w;
+let d_ofs = (uy + row) * SCR_W + ux;
+dst[d_ofs..d_ofs + w].copy_from_slice(&src_slice[s_ofs..s_ofs + w]);
 }
 }
 #[unsafe(no_mangle)]
@@ -366,35 +342,37 @@ x: c_int,
 y: c_int,
 scrn: c_int,
 width: c_int,
-mut height: c_int,
-mut dest: *mut u8,
+height: c_int,
+dest: *mut u8,
 ) {
-unsafe {
 if x < 0
 || x + width > SCREENWIDTH as c_int
 || y < 0
 || y + height > SCREENHEIGHT as c_int
 || (scrn as u32) > 4
+|| dest.is_null()
 {
-doom_error("Bad V_DrawBlock");
+doom_error("Bad V_GetBlock");
 }
-let scr_ptr = &raw const screens as *const *mut u8;
-let mut src = (*scr_ptr.add(scrn as usize)).add(SCR_W * (y as usize) + (x as usize));
-while height > 0 {
-ptr::copy_nonoverlapping(src, dest, width as usize);
-src = src.add(SCR_W);
-dest = dest.add(width as usize);
-height -= 1;
-}
+let w = width as usize;
+let h = height as usize;
+let ux = x as usize;
+let uy = y as usize;
+let src = unsafe { get_screen_slice(scrn) };
+let dst_slice = unsafe { std::slice::from_raw_parts_mut(dest, w * h) };
+for row in 0..h {
+let s_ofs = (uy + row) * SCR_W + ux;
+let d_ofs = row * w;
+dst_slice[d_ofs..d_ofs + w].copy_from_slice(&src[s_ofs..s_ofs + w]);
 }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn V_Init() {
+let base = Box::leak(vec![0u8; SCR_SIZE * 4].into_boxed_slice());
 unsafe {
-let base = I_AllocLow((SCR_W * SCR_H * 4) as c_int);
-let scr_ptr = &raw mut screens as *mut *mut u8;
+let scr_ptr = (&raw mut screens) as *mut *mut u8;
 for i in 0..4 {
-*scr_ptr.add(i) = base.add(i * SCR_W * SCR_H);
+*scr_ptr.add(i) = base.as_mut_ptr().add(i * SCR_SIZE);
 }
 }
 }

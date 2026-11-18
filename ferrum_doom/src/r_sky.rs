@@ -1,21 +1,43 @@
-use std::ffi::c_int;
+use std::sync::atomic::{AtomicI32, Ordering};
 use crate::m_fixed::FRACUNIT;
 
-#[unsafe(no_mangle)]
-pub static mut skyflatnum: c_int = 0;
+static SKY_FLAT_NUM: AtomicI32 = AtomicI32::new(0);
+static SKY_TEXTURE: AtomicI32 = AtomicI32::new(0);
+static SKY_TEXTURE_MID: AtomicI32 = AtomicI32::new(0);
 
-#[unsafe(no_mangle)]
-pub static mut skytexture: c_int = 0;
+#[inline]
+pub fn get_sky_flat_num() -> i32 {
+    SKY_FLAT_NUM.load(Ordering::Relaxed)
+}
 
-#[unsafe(no_mangle)]
-pub static mut skytexturemid: i32 = 0;
+#[inline]
+pub fn set_sky_flat_num(val: i32) {
+    SKY_FLAT_NUM.store(val, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn get_sky_texture() -> i32 {
+    SKY_TEXTURE.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn set_sky_texture(val: i32) {
+    SKY_TEXTURE.store(val, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn get_sky_texture_mid() -> i32 {
+    SKY_TEXTURE_MID.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn set_sky_texture_mid(val: i32) {
+    SKY_TEXTURE_MID.store(val, Ordering::Relaxed);
+}
 
 /// Инициализирует вертикальное смещение текстуры неба при изменении размера окна
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn R_InitSkyMap() {
-    unsafe {
-        skytexturemid = 100 * FRACUNIT;
-    }
+pub fn r_init_sky_map() {
+    set_sky_texture_mid(100 * FRACUNIT);
 }
 
 #[cfg(test)]
@@ -24,10 +46,7 @@ mod tests {
 
     #[test]
     fn test_init_sky_map() {
-        unsafe {
-            R_InitSkyMap();
-            let mid = skytexturemid;
-            assert_eq!(mid, 100 * FRACUNIT);
-        }
+        r_init_sky_map();
+        assert_eq!(get_sky_texture_mid(), 100 * FRACUNIT);
     }
 }

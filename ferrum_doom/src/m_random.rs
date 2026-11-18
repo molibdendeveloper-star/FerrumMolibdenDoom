@@ -1,4 +1,4 @@
-use std::ffi::c_int;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 pub const RNDTABLE: [u8; 256] = [
     0,   8, 109, 220, 222, 241, 149, 107,  75, 248, 254, 140,  16,  66,
@@ -22,35 +22,30 @@ pub const RNDTABLE: [u8; 256] = [
     120, 163, 236, 249,
 ];
 
-// Экспортируем глобальные переменные, так как g_game.c читает rndindex напрямую
-#[unsafe(no_mangle)]
-pub static mut rndindex: c_int = 0;
+static RND_INDEX: AtomicU8 = AtomicU8::new(0);
+static PRND_INDEX: AtomicU8 = AtomicU8::new(0);
 
-#[unsafe(no_mangle)]
-pub static mut prndindex: c_int = 0;
+#[inline]
+pub fn get_rnd_index() -> i32 {
+    RND_INDEX.load(Ordering::Relaxed) as i32
+}
 
 #[inline]
 pub fn p_random() -> i32 {
-    unsafe {
-        prndindex = (prndindex + 1) & 0xff;
-        RNDTABLE[prndindex as usize] as i32
-    }
+    let next = PRND_INDEX.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    RNDTABLE[next as usize] as i32
 }
 
 #[inline]
 pub fn m_random() -> i32 {
-    unsafe {
-        rndindex = (rndindex + 1) & 0xff;
-        RNDTABLE[rndindex as usize] as i32
-    }
+    let next = RND_INDEX.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    RNDTABLE[next as usize] as i32
 }
 
 #[inline]
 pub fn m_clear_random() {
-    unsafe {
-        rndindex = 0;
-        prndindex = 0;
-    }
+    RND_INDEX.store(0, Ordering::Relaxed);
+    PRND_INDEX.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]

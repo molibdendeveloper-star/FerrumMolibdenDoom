@@ -2,23 +2,23 @@
 
 pub use crate::bindings::*;
 use crate::r_segs::line_s;
-use crate::r_things::player_s;
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::mem::size_of;
 use std::ptr;
+use std::sync::Mutex;
 
 use crate::m_random::p_random;
+use crate::p_floor::t_move_plane;
 use crate::p_spec::{
     P_FindHighestFloorSurrounding, P_FindLowestFloorSurrounding, P_FindNextHighestFloor,
     P_FindSectorFromLineTag,
 };
-use crate::p_tick::{P_AddThinker, P_RemoveThinker, leveltime};
+use crate::p_tick::{P_AddThinker, P_RemoveThinker, get_leveltime};
 use crate::z_zone::{PU_LEVSPEC, Z_Malloc};
 
 const MAX_PLATS_COUNT: usize = MAXPLATS as usize;
 
-// Состояния платформы (enum plat_e)
 const PLAT_UP: u32 = 0;
 const PLAT_DOWN: u32 = 1;
 const PLAT_WAITING: u32 = 2;
@@ -27,14 +27,6 @@ const PLAT_IN_STASIS: u32 = 3;
 unsafe extern "C" {
     fn I_Error(error: *const c_char, ...);
     fn S_StartSound(origin: *mut c_void, sound_id: c_int);
-    fn T_MovePlane(
-        sector: *mut sector_t,
-        speed: i32,
-        dest: i32,
-        crush: c_int,
-        floor_or_ceiling: c_int,
-        direction: c_int,
-    ) -> result_e;
 
     static mut sectors: *mut sector_t;
     static mut sides: *mut side_t;
@@ -48,73 +40,100 @@ fn doom_error(msg: &str) -> ! {
     unreachable!("I_Error should never return");
 }
 
-// --- Глобальные переменные p_plats.c ---
-#[unsafe(no_mangle)]
-pub static mut activeplats: [*mut plat_t; MAX_PLATS_COUNT] = [ptr::null_mut(); MAX_PLATS_COUNT];
+static ACTIVE_PLATS: Mutex<[usize; MAX_PLATS_COUNT]> = Mutex::new([0; MAX_PLATS_COUNT]);
 
-// --- T_PlatRaise ---
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn T_PlatRaise(plat: *mut plat_t) {
-    unsafe {
-        let sec = (*plat).sector;
-        let sound_org = (&raw mut (*sec).soundorg) as *mut c_void;
-
-        match (*plat).status as u32 {
-            PLAT_UP => {
-                let res = T_MovePlane(sec, (*plat).speed, (*plat).high, (*plat).crush, 0, 1);
-
-                if (*plat).type_ == raiseAndChange || (*plat).type_ == raiseToNearestAndChange {
-                    if (leveltime & 7) == 0 {
-                        S_StartSound(sound_org, sfx_stnmov as c_int);
-                    }
-                }
-
-                if res == crushed && (*plat).crush == 0 {
-                    (*plat).count = (*plat).wait;
-                    (*plat).status = PLAT_DOWN as _;
-                    S_StartSound(sound_org, sfx_pstart as c_int);
-                } else if res == pastdest {
-                    (*plat).count = (*plat).wait;
-                    (*plat).status = PLAT_WAITING as _;
-                    S_StartSound(sound_org, sfx_pstop as c_int);
-
-                    match (*plat).type_ {
-                        blazeDWUS | downWaitUpStay | raiseAndChange | raiseToNearestAndChange => {
-                            P_RemoveActivePlat(plat);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            PLAT_DOWN => {
-                let res = T_MovePlane(sec, (*plat).speed, (*plat).low, 0, 0, -1);
-
-                if res == pastdest {
-                    (*plat).count = (*plat).wait;
-                    (*plat).status = PLAT_WAITING as _;
-                    S_StartSound(sound_org, sfx_pstop as c_int);
-                }
-            }
-
-            PLAT_WAITING => {
-                (*plat).count -= 1;
-                if (*plat).count == 0 {
-                    if (*sec).floorheight == (*plat).low {
-                        (*plat).status = PLAT_UP as _;
-                    } else {
-                        (*plat).status = PLAT_DOWN as _;
-                    }
-                    S_StartSound(sound_org, sfx_pstart as c_int);
-                }
-            }
-
-            PLAT_IN_STASIS | _ => {}
-        }
+pub fn clear_active_plats() {
+    if let Ok(mut list) = ACTIVE_PLATS.lock() {
+        list.fill(0);
     }
 }
 
-// --- EV_DoPlat ---
+pub fn has_active_plat(p: *mut plat_t) -> bool {
+    let addr = p as usize;
+    if addr == 0 {
+        return false;
+    }
+    ACTIVE_PLATS
+        .lock()
+        .map(|list| list.contains(&addr))
+        .unwrap_or(false)
+}
+
+pub fn t_plat_raise(plat: &mut plat_t) {
+    let Some(sec) = (unsafe { plat.sector.as_mut() }) else {
+        return;
+    };
+    let sound_org = (&raw mut sec.soundorg) as *mut c_void;
+    let plat_ptr = plat as *mut plat_t;
+
+    match plat.status as u32 {
+        PLAT_UP => {
+            let res = t_move_plane(sec, plat.speed, plat.high, plat.crush, 0, 1);
+
+            if (plat.type_ == raiseAndChange || plat.type_ == raiseToNearestAndChange)
+                && (get_leveltime() & 7) == 0
+            {
+                unsafe {
+                    S_StartSound(sound_org, sfx_stnmov as c_int);
+                }
+            }
+
+            if res == crushed && plat.crush == 0 {
+                plat.count = plat.wait;
+                plat.status = PLAT_DOWN as _;
+                unsafe {
+                    S_StartSound(sound_org, sfx_pstart as c_int);
+                }
+            } else if res == pastdest {
+                plat.count = plat.wait;
+                plat.status = PLAT_WAITING as _;
+                unsafe {
+                    S_StartSound(sound_org, sfx_pstop as c_int);
+                }
+
+                match plat.type_ {
+                    blazeDWUS | downWaitUpStay | raiseAndChange | raiseToNearestAndChange => unsafe {
+                        P_RemoveActivePlat(plat_ptr);
+                    },
+                    _ => {}
+                }
+            }
+        }
+        PLAT_DOWN => {
+            let res = t_move_plane(sec, plat.speed, plat.low, 0, 0, -1);
+
+            if res == pastdest {
+                plat.count = plat.wait;
+                plat.status = PLAT_WAITING as _;
+                unsafe {
+                    S_StartSound(sound_org, sfx_pstop as c_int);
+                }
+            }
+        }
+        PLAT_WAITING => {
+            plat.count -= 1;
+            if plat.count == 0 {
+                plat.status = if sec.floorheight == plat.low {
+                    PLAT_UP as _
+                } else {
+                    PLAT_DOWN as _
+                };
+                unsafe {
+                    S_StartSound(sound_org, sfx_pstart as c_int);
+                }
+            }
+        }
+        PLAT_IN_STASIS | _ => {}
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn T_PlatRaise(plat: *mut plat_t) {
+    if let Some(p) = unsafe { plat.as_mut() } {
+        t_plat_raise(p);
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn EV_DoPlat(
     line: *mut line_t,
@@ -174,7 +193,6 @@ pub unsafe extern "C" fn EV_DoPlat(
                     (*sec).special = 0;
                     S_StartSound(sound_org, sfx_stnmov as c_int);
                 }
-
                 raiseAndChange => {
                     (*plat).speed = plat_spd / 2;
                     let s0 = *(&raw const (*line).sidenum as *const i16) as usize;
@@ -184,7 +202,6 @@ pub unsafe extern "C" fn EV_DoPlat(
                     (*plat).status = PLAT_UP as _;
                     S_StartSound(sound_org, sfx_stnmov as c_int);
                 }
-
                 downWaitUpStay => {
                     (*plat).speed = plat_spd * 4;
                     let mut low = P_FindLowestFloorSurrounding(spec_sec);
@@ -197,7 +214,6 @@ pub unsafe extern "C" fn EV_DoPlat(
                     (*plat).status = PLAT_DOWN as _;
                     S_StartSound(sound_org, sfx_pstart as c_int);
                 }
-
                 blazeDWUS => {
                     (*plat).speed = plat_spd * 8;
                     let mut low = P_FindLowestFloorSurrounding(spec_sec);
@@ -210,7 +226,6 @@ pub unsafe extern "C" fn EV_DoPlat(
                     (*plat).status = PLAT_DOWN as _;
                     S_StartSound(sound_org, sfx_pstart as c_int);
                 }
-
                 perpetualRaise => {
                     (*plat).speed = plat_spd;
                     let mut low = P_FindLowestFloorSurrounding(spec_sec);
@@ -229,7 +244,6 @@ pub unsafe extern "C" fn EV_DoPlat(
                     (*plat).status = (p_random() & 1) as _;
                     S_StartSound(sound_org, sfx_pstart as c_int);
                 }
-
                 _ => {}
             }
 
@@ -240,17 +254,20 @@ pub unsafe extern "C" fn EV_DoPlat(
     }
 }
 
-// --- P_ActivateInStasis ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn P_ActivateInStasis(tag: c_int) {
-    unsafe {
-        let plats_ptr = (&raw mut activeplats) as *mut *mut plat_t;
-        let raise_fn: unsafe extern "C" fn(*mut c_void) =
-            std::mem::transmute(T_PlatRaise as unsafe extern "C" fn(*mut plat_t));
+    let raise_fn: unsafe extern "C" fn(*mut c_void) =
+        unsafe { std::mem::transmute(T_PlatRaise as unsafe extern "C" fn(*mut plat_t)) };
 
-        for i in 0..MAX_PLATS_COUNT {
-            let p = *plats_ptr.add(i);
-            if !p.is_null() && (*p).tag == tag && ((*p).status as u32) == PLAT_IN_STASIS {
+    let addrs: Vec<usize> = ACTIVE_PLATS
+        .lock()
+        .map(|list| list.iter().copied().filter(|&a| a != 0).collect())
+        .unwrap_or_default();
+
+    for addr in addrs {
+        unsafe {
+            let p = addr as *mut plat_t;
+            if (*p).tag == tag && ((*p).status as u32) == PLAT_IN_STASIS {
                 (*p).status = (*p).oldstatus;
                 (*p).thinker.function.acp1 = Some(raise_fn);
             }
@@ -258,16 +275,19 @@ pub unsafe extern "C" fn P_ActivateInStasis(tag: c_int) {
     }
 }
 
-// --- EV_StopPlat ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn EV_StopPlat(line: *mut line_t) {
-    unsafe {
-        let plats_ptr = (&raw mut activeplats) as *mut *mut plat_t;
-        let tag = (*line).tag as c_int;
+    let tag = unsafe { (*line).tag as c_int };
 
-        for j in 0..MAX_PLATS_COUNT {
-            let p = *plats_ptr.add(j);
-            if !p.is_null() && ((*p).status as u32) != PLAT_IN_STASIS && (*p).tag == tag {
+    let addrs: Vec<usize> = ACTIVE_PLATS
+        .lock()
+        .map(|list| list.iter().copied().filter(|&a| a != 0).collect())
+        .unwrap_or_default();
+
+    for addr in addrs {
+        unsafe {
+            let p = addr as *mut plat_t;
+            if ((*p).status as u32) != PLAT_IN_STASIS && (*p).tag == tag {
                 (*p).oldstatus = (*p).status;
                 (*p).status = PLAT_IN_STASIS as _;
                 (*p).thinker.function.acv = None;
@@ -276,37 +296,44 @@ pub unsafe extern "C" fn EV_StopPlat(line: *mut line_t) {
     }
 }
 
-// --- P_AddActivePlat ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn P_AddActivePlat(plat: *mut plat_t) {
-    unsafe {
-        let plats_ptr = (&raw mut activeplats) as *mut *mut plat_t;
-
-        for i in 0..MAX_PLATS_COUNT {
-            let slot = plats_ptr.add(i);
-            if (*slot).is_null() {
-                *slot = plat;
-                return;
-            }
-        }
-doom_error("P_AddActivePlat: no more plats!");
-}
-}
-// --- P_RemoveActivePlat ---
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn P_RemoveActivePlat(plat: *mut plat_t) {
-unsafe {
-let plats_ptr = (&raw mut activeplats) as *mut *mut plat_t;
-for i in 0..MAX_PLATS_COUNT {
-let slot = plats_ptr.add(i);
-if *slot == plat {
-let sec = (*plat).sector;
-(*sec).specialdata = ptr::null_mut();
-P_RemoveThinker((&raw mut (*plat).thinker) as *mut crate::p_tick::thinker_t);
-*slot = ptr::null_mut();
+    let addr = plat as usize;
+if let Ok(mut list) = ACTIVE_PLATS.lock() {
+for slot in list.iter_mut() {
+if *slot == 0 {
+*slot = addr;
 return;
 }
 }
-doom_error("P_RemoveActivePlat: can't find plat!");
 }
+doom_error("P_AddActivePlat: no more plats!");
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn P_RemoveActivePlat(plat: *mut plat_t) {
+let addr = plat as usize;
+let removed = if let Ok(mut list) = ACTIVE_PLATS.lock() {
+let mut found = false;
+for slot in list.iter_mut() {
+if *slot == addr {
+*slot = 0;
+found = true;
+break;
+}
+}
+found
+} else {
+false
+};
+if removed && !plat.is_null() {
+unsafe {
+let sec = (*plat).sector;
+if !sec.is_null() {
+(*sec).specialdata = ptr::null_mut();
+}
+P_RemoveThinker((&raw mut (*plat).thinker) as *mut crate::p_tick::thinker_t);
+}
+return;
+}
+doom_error("P_RemoveActivePlat: can't find plat!");
 }

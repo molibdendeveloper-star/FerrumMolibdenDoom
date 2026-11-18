@@ -62,6 +62,7 @@ pub mod i_sound;
 pub mod i_net;
 pub mod i_system;
 pub mod i_main;
+pub mod mus2mid;
 
 // --- m_fixed ---
 #[unsafe(no_mangle)]

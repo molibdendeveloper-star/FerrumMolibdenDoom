@@ -126,3 +126,19 @@ pub unsafe extern "C" fn I_Error_rs(msg: *const c_char) -> ! {
         std::process::exit(-1);
     }
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn I_Error(fmt: *const c_char, arg: *const c_char) -> ! {
+    unsafe {
+        let fmt_str = if fmt.is_null() {
+            ""
+        } else {
+            CStr::from_ptr(fmt).to_str().unwrap_or("")
+        };
+        if fmt_str == "%s" && !arg.is_null() {
+            I_Error_rs(arg);
+        } else {
+            I_Error_rs(fmt);
+        }
+    }
+}

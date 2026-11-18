@@ -4,29 +4,27 @@ include!(concat!(env!("OUT_DIR"), "/doom_info_bindings.rs"));
 use crate::r_segs::line_s;
 use crate::r_things::player_s;
 
-use std::ffi::{CStr, c_char, c_double, c_float, c_int, c_short, c_uint, c_void};
+use std::ffi::{CStr, c_char, c_int, c_void};
+use std::fs::File;
+use std::io::Cursor;
 use std::ptr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use rustysynth::{MidiFile, MidiFileSequencer, SoundFont, Synthesizer, SynthesizerSettings};
 
 use crate::g_game::gametic;
+use crate::mus2mid::convert_mus_to_mid;
 use crate::s_sound::{snd_MusicVolume, snd_SfxVolume};
 use crate::sounds::{S_sfx, sfxinfo_t};
 use crate::w_wad::{W_CacheLumpNum, W_CheckNumForName, W_GetNumForName, W_LumpLength};
 use crate::z_zone::{PU_STATIC, Z_Free};
 
 const NUM_CHANNELS: usize = 8;
-const SAMPLERATE: c_int = 44100;
+const SAMPLERATE: i32 = 44100;
 const NUM_SFX: usize = NUMSFX as usize;
 
 const SDL_AUDIO_S16: u32 = 0x8010;
 const SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK: u32 = 0xFFFF_FFFF;
-
-const TML_PROGRAM_CHANGE: u8 = 0xC0;
-const TML_NOTE_ON: u8 = 0x90;
-const TML_NOTE_OFF: u8 = 0x80;
-const TML_PITCH_BEND: u8 = 0xE0;
-const TML_CONTROL_CHANGE: u8 = 0xB0;
-const TSF_STEREO_INTERLEAVED: c_int = 0;
 
 #[repr(C)]
 pub struct SDL_AudioStream {
@@ -41,11 +39,6 @@ pub struct SDL_AudioSpec {
     pub freq: c_int,
 }
 
-#[repr(C)]
-pub struct tsf {
-    _private: [u8; 0],
-}
-
 type SDL_AudioStreamCallback = unsafe extern "C" fn(
     userdata: *mut c_void,
     stream: *mut SDL_AudioStream,
@@ -54,7 +47,6 @@ type SDL_AudioStreamCallback = unsafe extern "C" fn(
 );
 
 unsafe extern "C" {
-    fn free(ptr: *mut c_void);
     fn SDL_InitSubSystem(flags: u32) -> bool;
     fn SDL_GetError() -> *const c_char;
     fn SDL_OpenAudioDeviceStream(
@@ -71,29 +63,6 @@ unsafe extern "C" {
     fn SDL_ResumeAudioStreamDevice(stream: *mut SDL_AudioStream) -> bool;
     fn SDL_PutAudioStreamData(stream: *mut SDL_AudioStream, buf: *const c_void, len: c_int) -> bool;
     fn SDL_DestroyAudioStream(stream: *mut SDL_AudioStream);
-
-    fn tsf_load_filename(filename: *const c_char) -> *mut tsf;
-    fn tsf_close(f: *mut tsf);
-    fn tsf_reset(f: *mut tsf);
-    fn tsf_set_output(f: *mut tsf, outputmode: c_int, samplerate: c_int, global_gain_db: c_float);
-    fn tsf_set_volume(f: *mut tsf, global_volume: c_float);
-    fn tsf_channel_set_bank_preset(f: *mut tsf, channel: c_int, bank: c_int, preset_number: c_int) -> c_int;
-    fn tsf_channel_set_presetnumber(f: *mut tsf, channel: c_int, preset_number: c_int, flag_mididrums: c_int) -> c_int;
-    fn tsf_channel_note_on(f: *mut tsf, channel: c_int, key: c_int, vel: c_float) -> c_int;
-    fn tsf_channel_note_off(f: *mut tsf, channel: c_int, key: c_int);
-    fn tsf_channel_set_pitchwheel(f: *mut tsf, channel: c_int, pitch_wheel: c_int) -> c_int;
-    fn tsf_channel_midi_control(f: *mut tsf, channel: c_int, controller: c_int, control_value: c_int) -> c_int;
-    fn tsf_render_short(f: *mut tsf, buffer: *mut c_short, samples: c_int, flag_mixing: c_int);
-
-    fn tml_load_memory(buffer: *const c_void, size: c_int) -> *mut tml_message;
-    fn tml_free(f: *mut tml_message);
-
-    #[link_name = "rust_mus2mid_convert"]
-    fn mus2mid_convert(
-        mus_data: *const u8,
-        midi_out: *mut *mut u8,
-        midi_len_out: *mut usize,
-    ) -> c_int;
 }
 
 #[unsafe(no_mangle)]
@@ -109,8 +78,8 @@ struct SfxSample {
 struct Channel {
     active: bool,
     sfx_id: usize,
-    pos_fp: u64,   // позиция в формате 48.16 fixed-point
-    step_fp: u64,  // шаг в формате 48.16 fixed-point
+    pos_fp: u64,
+    step_fp: u64,
     handle: c_int,
     start_tic: c_int,
     left_vol: i32,
@@ -123,19 +92,17 @@ struct AudioEngine {
     pitch_mul: [f64; 256],
     next_handle: c_int,
 
-    tsf: *mut tsf,
-    tml_head: *mut tml_message,
-    tml_curr: *mut tml_message,
-    msec: f64,
+    soundfont: Option<Arc<SoundFont>>,
+    sequencer: Option<MidiFileSequencer>,
+    current_midi: Option<Arc<MidiFile>>,
     music_playing: bool,
     music_looping: bool,
     music_volume: f32,
 
+    mus_left: Vec<f32>,
+    mus_right: Vec<f32>,
     mix_buf: Vec<i16>,
-    mus_buf: Vec<i16>,
 }
-
-unsafe impl Send for AudioEngine {}
 
 impl AudioEngine {
     fn new() -> Self {
@@ -150,102 +117,45 @@ impl AudioEngine {
             channels: std::array::from_fn(|_| Channel::default()),
             pitch_mul,
             next_handle: 100,
-            tsf: ptr::null_mut(),
-            tml_head: ptr::null_mut(),
-            tml_curr: ptr::null_mut(),
-            msec: 0.0,
+            soundfont: None,
+            sequencer: None,
+            current_midi: None,
             music_playing: false,
             music_looping: false,
             music_volume: 0.5,
+            mus_left: Vec::with_capacity(4096),
+            mus_right: Vec::with_capacity(4096),
             mix_buf: Vec::with_capacity(8192),
-            mus_buf: Vec::with_capacity(8192),
-        }
-    }
-
-    fn stop_song_and_reset(&mut self) {
-        self.music_playing = false;
-        if !self.tsf.is_null() {
-            unsafe {
-                tsf_reset(self.tsf);
-                tsf_channel_set_bank_preset(self.tsf, 9, 128, 0);
-            }
-        }
-    }
-
-    fn render_music(&mut self, sample_count: usize) {
-        self.mus_buf.resize(sample_count * 2, 0);
-        self.mus_buf.fill(0);
-
-        if self.tsf.is_null() || !self.music_playing || self.tml_curr.is_null() {
-            return;
-        }
-
-        let mut rendered = 0usize;
-        while rendered < sample_count {
-            unsafe {
-                while !self.tml_curr.is_null() && self.msec >= ((*self.tml_curr).time as c_double) {
-                    let msg = &*self.tml_curr;
-                    let ch = msg.channel as c_int;
-                    match msg.type_ {
-                        TML_PROGRAM_CHANGE => {
-                            let prog = msg.__bindgen_anon_1.__bindgen_anon_1.__bindgen_anon_1.program as c_int;
-                            tsf_channel_set_presetnumber(self.tsf, ch, prog, (ch == 9) as c_int);
-                        }
-                        TML_NOTE_ON => {
-                            let key = msg.__bindgen_anon_1.__bindgen_anon_1.__bindgen_anon_1.key as c_int;
-                            let vel = (msg.__bindgen_anon_1.__bindgen_anon_1.__bindgen_anon_2.velocity as f32) / 127.0;
-                            tsf_channel_note_on(self.tsf, ch, key, vel);
-                        }
-                        TML_NOTE_OFF => {
-                            let key = msg.__bindgen_anon_1.__bindgen_anon_1.__bindgen_anon_1.key as c_int;
-                            tsf_channel_note_off(self.tsf, ch, key);
-                        }
-                        TML_PITCH_BEND => {
-                            let bend = msg.__bindgen_anon_1.__bindgen_anon_2.pitch_bend as c_int;
-                            tsf_channel_set_pitchwheel(self.tsf, ch, bend);
-                        }
-                        TML_CONTROL_CHANGE => {
-                            let ctrl = msg.__bindgen_anon_1.__bindgen_anon_1.__bindgen_anon_1.control as c_int;
-                            let val = msg.__bindgen_anon_1.__bindgen_anon_1.__bindgen_anon_2.control_value as c_int;
-                            tsf_channel_midi_control(self.tsf, ch, ctrl, val);
-                        }
-                        _ => {}
-                    }
-                    self.tml_curr = msg.next;
-                }
-            }
-
-            if self.tml_curr.is_null() {
-                if self.music_looping && !self.tml_head.is_null() {
-                    self.tml_curr = self.tml_head;
-                    self.msec = 0.0;
-                } else {
-                    self.music_playing = false;
-                    break;
-                }
-            }
-
-            let chunk = (sample_count - rendered).min(64);
-            unsafe {
-                tsf_render_short(
-                    self.tsf,
-                    self.mus_buf.as_mut_ptr().add(rendered * 2),
-                    chunk as c_int,
-                    0,
-                );
-            }
-            self.msec += ((chunk as f64) * 1000.0) / (SAMPLERATE as f64);
-            rendered += chunk;
         }
     }
 
     fn mix_frame(&mut self, sample_count: usize) {
         self.mix_buf.resize(sample_count * 2, 0);
-        self.render_music(sample_count);
+        self.mus_left.resize(sample_count, 0.0);
+        self.mus_right.resize(sample_count, 0.0);
+        self.mus_left.fill(0.0);
+        self.mus_right.fill(0.0);
+
+        if self.music_playing {
+            if let Some(seq) = self.sequencer.as_mut() {
+                seq.render(&mut self.mus_left, &mut self.mus_right);
+                if seq.end_of_sequence() {
+                    if self.music_looping {
+                        if let Some(midi) = self.current_midi.as_ref() {
+                            seq.play(midi, true);
+                        }
+                    } else {
+                        self.music_playing = false;
+                    }
+                }
+            }
+        }
+
+        let mus_gain = self.music_volume * 32767.0;
 
         for frame in 0..sample_count {
-            let mut dl: i32 = self.mus_buf[frame * 2] as i32;
-            let mut dr: i32 = self.mus_buf[frame * 2 + 1] as i32;
+            let mut dl = (self.mus_left[frame] * mus_gain) as i32;
+            let mut dr = (self.mus_right[frame] * mus_gain) as i32;
 
             for ch in &mut self.channels {
                 if !ch.active {
@@ -258,7 +168,6 @@ impl AudioEngine {
                     continue;
                 }
 
-                // Преобразуем беззнаковый 8-битный PCM (128 = тишина) в знаковый [-128..127]
                 let pcm = (sample_data[idx] as i32) - 128;
                 dl += (pcm * ch.left_vol * 256) / 127;
                 dr += (pcm * ch.right_vol * 256) / 127;
@@ -285,147 +194,155 @@ fn engine() -> &'static Mutex<AudioEngine> {
 unsafe fn load_wad_sfx(sfxname: *const c_char) -> SfxSample {
     unsafe {
         if sfxname.is_null() {
-return SfxSample::default();
+            return SfxSample::default();
+        }
+        let name_str = CStr::from_ptr(sfxname).to_string_lossy();
+        let full_name = format!("ds{}\0", name_str);
+
+        let sfxlump = if W_CheckNumForName(full_name.as_ptr() as *mut c_char) == -1 {
+            W_GetNumForName(b"dspistol\0".as_ptr() as *mut c_char)
+        } else {
+            W_GetNumForName(full_name.as_ptr() as *mut c_char)
+        };
+
+        let size = W_LumpLength(sfxlump) as usize;
+        if size <= 8 {
+            return SfxSample::default();
+        }
+
+        let raw = W_CacheLumpNum(sfxlump, PU_STATIC) as *const u8;
+        let bytes = std::slice::from_raw_parts(raw, size);
+
+        let mut rate = u16::from_le_bytes([bytes[2], bytes[3]]) as u32;
+        if rate == 0 {
+            rate = 11025;
+        }
+        let declared_len = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+        let pcm_len = declared_len.min(size - 8);
+        let data = bytes[8..(8 + pcm_len)].to_vec();
+
+        Z_Free(raw as *mut c_void);
+        SfxSample { data, sample_rate: rate }
+    }
 }
-let name_str = CStr::from_ptr(sfxname).to_string_lossy();
-let full_name = format!("ds{}\0", name_str);
-let sfxlump = if W_CheckNumForName(full_name.as_ptr() as *mut c_char) == -1 {
-W_GetNumForName(b"dspistol\0".as_ptr() as *mut c_char)
-} else {
-W_GetNumForName(full_name.as_ptr() as *mut c_char)
-};
-let size = W_LumpLength(sfxlump) as usize;
-if size <= 8 {
-return SfxSample::default();
-}
-let raw = W_CacheLumpNum(sfxlump, PU_STATIC) as *const u8;
-let bytes = std::slice::from_raw_parts(raw, size);
-// Заголовок DMX SFX: [u16 format=3][u16 sample_rate][u32 sample_count]
-let mut rate = u16::from_le_bytes([bytes[2], bytes[3]]) as u32;
-if rate == 0 {
-rate = 11025;
-}
-let declared_len = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
-let pcm_len = declared_len.min(size - 8);
-let data = bytes[8..(8 + pcm_len)].to_vec();
-Z_Free(raw as *mut c_void);
-SfxSample { data, sample_rate: rate }
-}
-}
+
 unsafe extern "C" fn audio_stream_callback(
-_userdata: *mut c_void,
-stream: *mut SDL_AudioStream,
-additional_amount: c_int,
-_total_amount: c_int,
+    _userdata: *mut c_void,
+    stream: *mut SDL_AudioStream,
+    additional_amount: c_int,
+    _total_amount: c_int,
 ) {
-if additional_amount <= 0 {
-return;
+    if additional_amount <= 0 {
+        return;
+    }
+    let samples = (additional_amount as usize) / 4;
+    if samples == 0 {
+        return;
+    }
+
+    let mut eng = engine().lock().unwrap();
+    eng.mix_frame(samples);
+    unsafe {
+        SDL_PutAudioStreamData(
+            stream,
+            eng.mix_buf.as_ptr() as *const c_void,
+            (samples * 4) as c_int,
+        );
+    }
 }
-let samples = (additional_amount as usize) / 4;
-if samples == 0 {
-return;
-}
-let mut eng = engine().lock().unwrap();
-eng.mix_frame(samples);
-unsafe {
-SDL_PutAudioStreamData(
-stream,
-eng.mix_buf.as_ptr() as *const c_void,
-(samples * 4) as c_int,
-);
-}
-}
-// --- C ABI: SFX ---
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn I_SetChannels() {}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn I_SetSfxVolume(volume: c_int) {
-unsafe {
-snd_SfxVolume = volume;
+    unsafe {
+        snd_SfxVolume = volume;
+    }
 }
-}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn I_SetMusicVolume(volume: c_int) {
-unsafe {
-snd_MusicVolume = volume;
+    unsafe {
+        snd_MusicVolume = volume;
+    }
+    let mut eng = engine().lock().unwrap();
+    eng.music_volume = (volume as f32) / 15.0;
 }
-let mut eng = engine().lock().unwrap();
-eng.music_volume = (volume as f32) / 15.0;
-if !eng.tsf.is_null() {
-unsafe {
-tsf_set_volume(eng.tsf, eng.music_volume);
-}
-}
-}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn I_GetSfxLumpNum(sfx: *mut sfxinfo_t) -> c_int {
-unsafe {
-let name_str = CStr::from_ptr((*sfx).name).to_string_lossy();
-let full_name = format!("ds{}\0", name_str);
-W_GetNumForName(full_name.as_ptr() as *mut c_char)
+    unsafe {
+        let name_str = CStr::from_ptr((*sfx).name).to_string_lossy();
+        let full_name = format!("ds{}\0", name_str);
+        W_GetNumForName(full_name.as_ptr() as *mut c_char)
+    }
 }
-}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn I_StartSound(
-id: c_int,
-vol: c_int,
-sep: c_int,
-pitch: c_int,
-_priority: c_int,
+    id: c_int,
+    vol: c_int,
+    sep: c_int,
+    pitch: c_int,
+    _priority: c_int,
 ) -> c_int {
-unsafe {
-if AUDIO_STREAM.is_null() {
-return 0;
-}
-}
-let sfx_id = id as usize;
-if sfx_id == 0 || sfx_id >= NUM_SFX {
-return 0;
-}
-let mut eng = engine().lock().unwrap();
-if eng.sfx_bank[sfx_id].data.is_empty() {
-return 0;
-}
-// Останавливаем дублирующиеся звуки пилы и пистолета
-if id == (sfx_sawup as c_int)
-|| id == (sfx_sawidl as c_int)
-|| id == (sfx_sawful as c_int)
-|| id == (sfx_sawhit as c_int)
-|| id == (sfx_stnmov as c_int)
-|| id == (sfx_pistol as c_int)
-{
-for ch in &mut eng.channels {
-if ch.active && ch.sfx_id == sfx_id {
-ch.active = false;
-break;
-}
-}
-}
-let mut slot = 0usize;
-let mut oldest = unsafe { gametic };
-let mut found_free = false;
-for (i, ch) in eng.channels.iter().enumerate() {
-if !ch.active {
-slot = i;
-found_free = true;
-break;
-}
-if ch.start_tic < oldest {
-oldest = ch.start_tic;
-slot = i;
-}
-}
-let _ = found_free;
-let pitch_idx = pitch.clamp(0, 255) as usize;
-let rate_ratio = (eng.sfx_bank[sfx_id].sample_rate as f64) / (SAMPLERATE as f64);
-let step_fp = (eng.pitch_mul[pitch_idx] * rate_ratio * 65536.0) as u64;
-let s1 = sep + 1;
-let left_vol = (vol - ((vol * s1 * s1) >> 16)).clamp(0, 127);
-let s2 = s1 - 257;
-let right_vol = (vol - ((vol * s2 * s2) >> 16)).clamp(0, 127);
-let handle = eng.next_handle;
-eng.next_handle = if eng.next_handle >= 30000 { 100 } else { eng.next_handle + 1 };
-eng.channels[slot] = Channel {
+    unsafe {
+        if AUDIO_STREAM.is_null() {
+            return 0;
+        }
+    }
+    let sfx_id = id as usize;
+    if sfx_id == 0 || sfx_id >= NUM_SFX {
+        return 0;
+    }
+
+    let mut eng = engine().lock().unwrap();
+    if eng.sfx_bank[sfx_id].data.is_empty() {
+        return 0;
+    }
+
+    if id == (sfx_sawup as c_int)
+        || id == (sfx_sawidl as c_int)
+        || id == (sfx_sawful as c_int)
+        || id == (sfx_sawhit as c_int)
+        || id == (sfx_stnmov as c_int)
+        || id == (sfx_pistol as c_int)
+    {
+        for ch in &mut eng.channels {
+            if ch.active && ch.sfx_id == sfx_id {
+                ch.active = false;
+                break;
+            }
+        }
+    }
+
+    let mut slot = 0usize;
+    let mut oldest = unsafe { gametic };
+    for (i, ch) in eng.channels.iter().enumerate() {
+        if !ch.active {
+            slot = i;
+            break;
+        }
+        if ch.start_tic < oldest {
+            oldest = ch.start_tic;
+            slot = i;
+        }
+    }
+
+    let pitch_idx = pitch.clamp(0, 255) as usize;
+    let rate_ratio = (eng.sfx_bank[sfx_id].sample_rate as f64) / (SAMPLERATE as f64);
+    let step_fp = (eng.pitch_mul[pitch_idx] * rate_ratio * 65536.0) as u64;
+
+    let s1 = sep + 1;
+    let left_vol = (vol - ((vol * s1 * s1) >> 16)).clamp(0, 127);
+    let s2 = s1 - 257;
+    let right_vol = (vol - ((vol * s2 * s2) >> 16)).clamp(0, 127);
+
+    let handle = eng.next_handle;
+    eng.next_handle = if eng.next_handle >= 30000 { 100 } else { eng.next_handle + 1 };
+
+    eng.channels[slot] = Channel {
 active: true,
 sfx_id,
 pos_fp: 0,
@@ -520,31 +437,30 @@ eng.sfx_bank[i] = eng.sfx_bank[link_idx].clone();
 drop(eng);
 SDL_SetAudioStreamGetCallback(AUDIO_STREAM, Some(audio_stream_callback), ptr::null_mut());
 SDL_ResumeAudioStreamDevice(AUDIO_STREAM);
-eprintln!("I_InitSound: clean Rust SDL3 audio ready (44100Hz 16-bit stereo)");
+eprintln!("I_InitSound: 100% pure Rust SDL3 + rustySynth audio ready (44100Hz stereo)");
 }
 }
-// --- C ABI: MUSIC ---
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn I_InitMusic() {
-let sf_paths: [&[u8]; 4] = [
-b"soundfont.sf2\0",
-b"/usr/share/soundfonts/FluidR3_GM.sf2\0",
-b"/usr/share/sounds/sf2/FluidR3_GM.sf2\0",
-b"/usr/share/soundfonts/default.sf2\0",
+let sf_paths = [
+"soundfont.sf2",
+"/usr/share/soundfonts/FluidR3_GM.sf2",
+"/usr/share/sounds/sf2/FluidR3_GM.sf2",
+"/usr/share/soundfonts/default.sf2",
 ];
 let mut eng = engine().lock().unwrap();
 for path in sf_paths {
-let tsf_ptr = unsafe { tsf_load_filename(path.as_ptr() as *const c_char) };
-if !tsf_ptr.is_null() {
-unsafe {
-tsf_channel_set_bank_preset(tsf_ptr, 9, 128, 0);
-tsf_set_output(tsf_ptr, TSF_STEREO_INTERLEAVED, SAMPLERATE, 0.0);
-tsf_set_volume(tsf_ptr, eng.music_volume);
-}
-eng.tsf = tsf_ptr;
-let name = CStr::from_bytes_with_nul(path).unwrap().to_string_lossy();
-eprintln!("I_InitMusic: loaded SoundFont '{}'", name);
+if let Ok(mut file) = File::open(path) {
+if let Ok(sf) = SoundFont::new(&mut file) {
+let sf_arc = Arc::new(sf);
+let settings = SynthesizerSettings::new(SAMPLERATE);
+if let Ok(synth) = Synthesizer::new(&sf_arc, &settings) {
+eng.soundfont = Some(sf_arc);
+eng.sequencer = Some(MidiFileSequencer::new(synth));
+eprintln!("I_InitMusic: loaded SoundFont '{}' (rustySynth)", path);
 return;
+}
+}
 }
 }
 eprintln!("I_InitMusic: no SoundFont (.sf2) found, music disabled");
@@ -553,27 +469,20 @@ eprintln!("I_InitMusic: no SoundFont (.sf2) found, music disabled");
 pub unsafe extern "C" fn I_ShutdownMusic() {
 let mut eng = engine().lock().unwrap();
 eng.music_playing = false;
-if !eng.tml_head.is_null() {
-unsafe { tml_free(eng.tml_head); }
-eng.tml_head = ptr::null_mut();
-eng.tml_curr = ptr::null_mut();
+if let Some(seq) = eng.sequencer.as_mut() {
+seq.stop();
 }
-if !eng.tsf.is_null() {
-unsafe { tsf_close(eng.tsf); }
-eng.tsf = ptr::null_mut();
-}
+eng.current_midi = None;
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn I_PlaySong(_handle: c_int, looping: c_int) {
 let mut eng = engine().lock().unwrap();
-if eng.tml_head.is_null() {
-return;
-}
-eng.stop_song_and_reset();
-eng.tml_curr = eng.tml_head;
-eng.msec = 0.0;
 eng.music_looping = looping != 0;
+    let midi_opt = eng.current_midi.clone();
+    if let (Some(seq), Some(midi)) = (eng.sequencer.as_mut(), midi_opt.as_ref()) {
+seq.play(midi, looping != 0);
 eng.music_playing = true;
+}
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn I_PauseSong(_handle: c_int) {
@@ -583,24 +492,26 @@ eng.music_playing = false;
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn I_ResumeSong(_handle: c_int) {
 let mut eng = engine().lock().unwrap();
-if !eng.tml_head.is_null() {
+if eng.current_midi.is_some() {
 eng.music_playing = true;
 }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn I_StopSong(_handle: c_int) {
 let mut eng = engine().lock().unwrap();
-eng.stop_song_and_reset();
+eng.music_playing = false;
+if let Some(seq) = eng.sequencer.as_mut() {
+seq.stop();
+}
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn I_UnRegisterSong(_handle: c_int) {
 let mut eng = engine().lock().unwrap();
-eng.stop_song_and_reset();
-if !eng.tml_head.is_null() {
-unsafe { tml_free(eng.tml_head); }
-eng.tml_head = ptr::null_mut();
-eng.tml_curr = ptr::null_mut();
+eng.music_playing = false;
+if let Some(seq) = eng.sequencer.as_mut() {
+seq.stop();
 }
+eng.current_midi = None;
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn I_RegisterSong(data: *mut c_void) -> c_int {
@@ -608,25 +519,19 @@ unsafe { I_UnRegisterSong(1); }
 if data.is_null() {
 return 0;
 }
-let mut midi_bytes: *mut u8 = ptr::null_mut();
-let mut midi_len: usize = 0;
-let converted = unsafe {
-mus2mid_convert(data as *const u8, &raw mut midi_bytes, &raw mut midi_len)
-};
-if converted == 0 || midi_bytes.is_null() {
+// Максимальный размер MUS-лампа в DOOM не превышает 64 КБ
+let mus_slice = unsafe { std::slice::from_raw_parts(data as *const u8, 65536) };
+let Some(mid_bytes) = convert_mus_to_mid(mus_slice) else {
 eprintln!("I_RegisterSong: failed to convert MUS to MIDI");
 return 0;
-}
-let head = unsafe { tml_load_memory(midi_bytes as *const c_void, midi_len as c_int) };
-unsafe { free(midi_bytes as *mut c_void); }
-if head.is_null() {
-eprintln!("I_RegisterSong: tml_load_memory failed");
+};
+let mut cursor = Cursor::new(mid_bytes);
+let Ok(midi_file) = MidiFile::new(&mut cursor) else {
+eprintln!("I_RegisterSong: rustySynth MidiFile parse failed");
 return 0;
-}
+};
 let mut eng = engine().lock().unwrap();
-eng.tml_head = head;
-eng.tml_curr = head;
-eng.msec = 0.0;
+eng.current_midi = Some(Arc::new(midi_file));
 1
 }
 #[unsafe(no_mangle)]

@@ -44,7 +44,7 @@ const BACKUP_TICS: usize = BACKUPTICS as usize;
 const VERSION: c_int = 109;
 const SAVEGAMENAME_STR: &str = "doomsav";
 const mus_intro: c_int = 29;
-const mus_dm2ttl: c_int = 65;
+const mus_dm2ttl: c_int = 66;
 
 unsafe extern "C" {
     fn I_Init();

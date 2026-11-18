@@ -11,12 +11,7 @@ fn main() {
     println!("cargo:rustc-link-lib=SDL3");
     println!("cargo:rustc-link-lib=m");
 
-    cc::Build::new()
-        .file("src/tsf_tml_impl.c")
-        .opt_level(3)
-        .include("../src/doom")
-        .include("../src")
-        .compile("tsf_tml_impl");
+    
 
     let bindings = bindgen::Builder::default()
         .header("../src/doom/doomdef.h")
@@ -47,8 +42,7 @@ fn main() {
         .header("../src/doom/g_game.h")
         .header("../src/doom/d_net.h")
         .header("../src/doom/d_main.h")
-        .header("../src/platform/tml.h")
-        .header("/usr/include/SDL3/SDL.h")
+                .header("/usr/include/SDL3/SDL.h")
         .clang_arg("-I../src/doom")
         .clang_arg("-I../src/platform")
         .clang_arg("-DNORMALUNIX")
@@ -109,8 +103,7 @@ fn main() {
         .allowlist_type("doomcom_t")
         .allowlist_type("doomdata_t")
         .allowlist_type("SDL_Event")
-        .allowlist_type("tml_message")
-        .allowlist_type("SDL_Keycode")
+                .allowlist_type("SDL_Keycode")
         .allowlist_type("SDL_MouseButtonFlags")
         .allowlist_type("SDL_WindowFlags")
         .allowlist_var("LIGHTZSHIFT")

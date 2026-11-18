@@ -11,3 +11,11 @@ bindgen = "0.71"
 cc = "1.0"
 [profile.dev]
 opt-level = 2
+
+[profile.release]
+opt-level = 1
+debug-assertions = false
+overflow-checks = false
+
+[dependencies]
+rustysynth = "1.3"

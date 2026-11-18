@@ -57,6 +57,11 @@ pub mod doomdef;
 pub mod doomstat;
 pub mod d_net;
 pub mod d_main;
+pub mod i_video;
+pub mod i_sound;
+pub mod i_net;
+pub mod i_system;
+pub mod i_main;
 
 // --- m_fixed ---
 #[unsafe(no_mangle)]

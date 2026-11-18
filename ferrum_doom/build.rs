@@ -8,6 +8,15 @@ fn main() {
     println!("cargo:rerun-if-changed=../src/doom/p_mobj.h");
     println!("cargo:rerun-if-changed=../src/doom/r_defs.h");
     println!("cargo:rerun-if-changed=../src/doom/r_main.h");
+    println!("cargo:rustc-link-lib=SDL3");
+    println!("cargo:rustc-link-lib=m");
+
+    cc::Build::new()
+        .file("src/tsf_tml_impl.c")
+        .opt_level(3)
+        .include("../src/doom")
+        .include("../src")
+        .compile("tsf_tml_impl");
 
     let bindings = bindgen::Builder::default()
         .header("../src/doom/doomdef.h")
@@ -38,6 +47,8 @@ fn main() {
         .header("../src/doom/g_game.h")
         .header("../src/doom/d_net.h")
         .header("../src/doom/d_main.h")
+        .header("../src/platform/tml.h")
+        .header("/usr/include/SDL3/SDL.h")
         .clang_arg("-I../src/doom")
         .clang_arg("-I../src/platform")
         .clang_arg("-DNORMALUNIX")
@@ -97,6 +108,11 @@ fn main() {
         .allowlist_type("playerstate_t")
         .allowlist_type("doomcom_t")
         .allowlist_type("doomdata_t")
+        .allowlist_type("SDL_Event")
+        .allowlist_type("tml_message")
+        .allowlist_type("SDL_Keycode")
+        .allowlist_type("SDL_MouseButtonFlags")
+        .allowlist_type("SDL_WindowFlags")
         .allowlist_var("LIGHTZSHIFT")
         .allowlist_var("MAXLIGHTZ")
         .allowlist_var("LIGHTLEVELS")
@@ -198,6 +214,15 @@ fn main() {
         .allowlist_var("D_CDROM")
         .allowlist_var("MAPBLOCKUNITS")
         .allowlist_var("PLAYERRADIUS")
+        .allowlist_var("SDL_INIT_.*")
+        .allowlist_var("SDL_WINDOW_.*")
+        .allowlist_var("SDL_LOGICAL_PRESENTATION_.*")
+        .allowlist_var("SDL_PIXELFORMAT_.*")
+        .allowlist_var("SDL_TEXTUREACCESS_.*")
+        .allowlist_var("SDL_SCALEMODE_.*")
+        .allowlist_var("SDL_EVENT_.*")
+        .allowlist_var("SDLK_.*")
+        .allowlist_var("SDL_BUTTON_.*")
         .allowlist_type("vissprite_t")
         .allowlist_type("spritedef_t")
         .allowlist_type("spriteframe_t")
@@ -806,6 +831,14 @@ fn main() {
         .blocklist_item("pagetic")
         .blocklist_item("pagename")
         .blocklist_item("title")
+        .blocklist_item("sndserver_filename")
+        .blocklist_item("DOOMPORT")
+        .blocklist_item("sendsocket")
+        .blocklist_item("insocket")
+        .blocklist_item("netget")
+        .blocklist_item("netsend")
+        .blocklist_item("mb_used")
+        .blocklist_item("emptycmd")
         .prepend_enum_name(false)
         .layout_tests(false)
         .derive_default(true)

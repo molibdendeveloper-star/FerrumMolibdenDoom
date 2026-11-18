@@ -1,6 +1,6 @@
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, static_mut_refs)]
 
-include!(concat!(env!("OUT_DIR"), "/doom_info_bindings.rs"));
+pub use crate::bindings::*;
 use crate::r_segs::line_s;
 use crate::r_things::player_s;
 

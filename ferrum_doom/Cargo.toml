@@ -7,8 +7,6 @@ edition = "2024"
 crate-type = ["staticlib", "rlib"]
 
 [build-dependencies]
-bindgen = "0.71"
-cc = "1.0"
 [profile.dev]
 opt-level = 2
 

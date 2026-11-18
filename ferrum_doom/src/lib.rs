@@ -1,3 +1,4 @@
+pub mod bindings;
 use std::ffi::{CStr, c_char, c_int, c_ulong, c_ushort};
 
 pub mod m_argv;

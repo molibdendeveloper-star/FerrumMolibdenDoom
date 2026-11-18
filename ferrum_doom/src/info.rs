@@ -84,7 +84,7 @@ unsafe extern "C" {
 }
 
 #[unsafe(no_mangle)]
-pub static mut sprnames: [*const c_char; 138] = [
+pub static mut sprnames: [*const c_char; 139] = [
     b"TROO\0".as_ptr() as *const c_char,
     b"SHTG\0".as_ptr() as *const c_char,
     b"PUNG\0".as_ptr() as *const c_char,
@@ -223,6 +223,7 @@ pub static mut sprnames: [*const c_char; 138] = [
     b"BRS1\0".as_ptr() as *const c_char,
     b"TLMP\0".as_ptr() as *const c_char,
     b"TLP2\0".as_ptr() as *const c_char,
+    std::ptr::null(),
 ];
 
 #[unsafe(no_mangle)]
